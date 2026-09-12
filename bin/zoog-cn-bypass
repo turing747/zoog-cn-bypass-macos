@@ -1,0 +1,273 @@
+#!/bin/zsh
+
+set -u
+umask 022
+
+readonly VERSION="1.0.0"
+readonly TOOL_PATH="${0:A}"
+readonly ROUTE_LABEL="com.local.zoog-cn-bypass"
+readonly DNS_LABEL="com.local.zoog-cn-dns"
+readonly INSTALL_DIR="/Library/Application Support/ZoogCNBypass"
+readonly ROUTE_PLIST="/Library/LaunchDaemons/$ROUTE_LABEL.plist"
+readonly DNS_PLIST="/Library/LaunchDaemons/$DNS_LABEL.plist"
+readonly STATE_FILE="/var/run/$ROUTE_LABEL.state"
+readonly ACTIVE_V4="/var/run/$ROUTE_LABEL.active-v4"
+readonly ACTIVE_V6="/var/run/$ROUTE_LABEL.active-v6"
+readonly ERROR_FILE="/var/run/$ROUTE_LABEL.error"
+readonly DNS_STATE_KEY="State:/Network/Service/com.local.zoog-cn-bypass/DNS"
+
+service_is_loaded() {
+  /bin/launchctl print "system/$1" >/dev/null 2>&1
+}
+
+zoog_status() {
+  /usr/sbin/scutil --nc status ZoogVPN 2>/dev/null | /usr/bin/head -n 1
+}
+
+dns_override_is_active() {
+  local definition
+
+  definition="$(/usr/bin/printf '%s\n' "show $DNS_STATE_KEY" quit | /usr/sbin/scutil 2>/dev/null)"
+  [[ "$definition" == *"0 : 127.0.0.1"* ]]
+}
+
+resolve_ipv4() {
+  /usr/bin/dig +time=2 +tries=1 +short @127.0.0.1 "$1" A 2>/dev/null | /usr/bin/awk '
+    /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { address = $0 }
+    END { print address }
+  '
+}
+
+route_interface() {
+  /sbin/route -n get "$1" 2>/dev/null | /usr/bin/awk '/interface:/ { print $2; exit }'
+}
+
+line_count() {
+  if [[ -r "$1" ]]; then
+    /usr/bin/wc -l < "$1" | /usr/bin/tr -d ' '
+  else
+    print 0
+  fi
+}
+
+status_command() {
+  local vpn_status route_service dns_service split_status routing_status
+  local cn_interface foreign_interface domestic_ip foreign_ip domestic_route foreign_route
+
+  vpn_status="$(zoog_status)"
+  [[ -n "$vpn_status" ]] || vpn_status="Unavailable"
+
+  if service_is_loaded "$ROUTE_LABEL"; then
+    route_service="loaded"
+  else
+    route_service="not loaded"
+  fi
+  if service_is_loaded "$DNS_LABEL"; then
+    dns_service="loaded"
+  else
+    dns_service="not loaded"
+  fi
+  if dns_override_is_active; then
+    split_status="active"
+  else
+    split_status="inactive"
+  fi
+
+  if [[ -r "$STATE_FILE" ]]; then
+    if [[ "$vpn_status" == "Connected" ]]; then
+      routing_status="active"
+    else
+      routing_status="standby (routes retained for fast reconnect)"
+    fi
+  else
+    routing_status="inactive"
+  fi
+
+  print -- "ZoogVPN: $vpn_status"
+  print -- "Route service: $route_service"
+  print -- "Local DNS service: $dns_service"
+  print -- "Split DNS override: $split_status"
+  print -- "China-direct routing: $routing_status"
+  print -- "Installed IPv4 routes: $(line_count "$ACTIVE_V4")"
+  print -- "Installed IPv6 routes: $(line_count "$ACTIVE_V6")"
+
+  if [[ -r "$ERROR_FILE" ]]; then
+    print -- "Last error: $(<"$ERROR_FILE")"
+  fi
+
+  cn_interface="$(route_interface 223.5.5.5)"
+  foreign_interface="$(route_interface 1.1.1.1)"
+  print -- "Route check — China 223.5.5.5: ${cn_interface:-unknown}"
+  print -- "Route check — foreign 1.1.1.1: ${foreign_interface:-unknown}"
+
+  if service_is_loaded "$DNS_LABEL"; then
+    domestic_ip="$(resolve_ipv4 www.baidu.com)"
+    foreign_ip="$(resolve_ipv4 www.cloudflare.com)"
+    domestic_route=""
+    foreign_route=""
+    [[ -n "$domestic_ip" ]] && domestic_route="$(route_interface "$domestic_ip")"
+    [[ -n "$foreign_ip" ]] && foreign_route="$(route_interface "$foreign_ip")"
+    print -- "DNS check — www.baidu.com: ${domestic_ip:-unresolved} via ${domestic_route:-unknown}"
+    print -- "DNS check — www.cloudflare.com: ${foreign_ip:-unresolved} via ${foreign_route:-unknown}"
+  fi
+}
+
+run_with_admin() {
+  local action="$1"
+
+  /usr/bin/osascript \
+    -e 'on run argv' \
+    -e 'set toolPath to item 1 of argv' \
+    -e 'set toolAction to item 2 of argv' \
+    -e 'return do shell script (quoted form of toolPath & " " & quoted form of toolAction) with administrator privileges' \
+    -e 'end run' \
+    -- "$TOOL_PATH" "$action"
+}
+
+require_root() {
+  local action="$1"
+
+  if [[ "$(/usr/bin/id -u)" -ne 0 ]]; then
+    run_with_admin "$action"
+    exit $?
+  fi
+}
+
+bootstrap_service() {
+  local label="$1"
+  local plist="$2"
+
+  /bin/launchctl enable "system/$label"
+  if ! service_is_loaded "$label"; then
+    /bin/launchctl bootstrap system "$plist"
+  fi
+  /bin/launchctl kickstart -k "system/$label"
+}
+
+wait_for_dns() {
+  local attempt
+
+  for attempt in {1..30}; do
+    if [[ -n "$(resolve_ipv4 www.baidu.com)" ]]; then
+      return 0
+    fi
+    /bin/sleep 1
+  done
+  return 1
+}
+
+wait_for_active_split() {
+  local attempt
+
+  for attempt in {1..120}; do
+    if [[ -r "$STATE_FILE" ]] && dns_override_is_active; then
+      return 0
+    fi
+    /bin/sleep 1
+  done
+  return 1
+}
+
+enable_command() {
+  require_root enable
+
+  if [[ ! -x "$INSTALL_DIR/dnsmasq" || ! -x "$INSTALL_DIR/daemon.sh" ]]; then
+    print -u 2 -- "ZoogCNBypass is not installed correctly. Re-run the installer."
+    return 69
+  fi
+
+  "$INSTALL_DIR/dnsmasq" --test --conf-file="$INSTALL_DIR/dnsmasq.conf" >/dev/null
+  bootstrap_service "$DNS_LABEL" "$DNS_PLIST"
+  if ! wait_for_dns; then
+    print -u 2 -- "The local DNS service did not become ready."
+    return 1
+  fi
+
+  bootstrap_service "$ROUTE_LABEL" "$ROUTE_PLIST"
+  if [[ "$(zoog_status)" == "Connected" ]]; then
+    print -- "ZoogVPN is connected; waiting for China routes and split DNS..."
+    if ! wait_for_active_split; then
+      print -u 2 -- "Activation timed out. Run: zoog-cn-bypass status"
+      return 1
+    fi
+    print -- "ZoogCNBypass enabled and active."
+  else
+    print -- "ZoogCNBypass enabled. It will activate when ZoogVPN connects."
+  fi
+}
+
+disable_internal() {
+  /bin/launchctl bootout "system/$ROUTE_LABEL" >/dev/null 2>&1 || true
+  /bin/launchctl disable "system/$ROUTE_LABEL"
+
+  if [[ -x "$INSTALL_DIR/daemon.sh" ]]; then
+    print -- "Removing the recorded China routes and DNS override..."
+    "$INSTALL_DIR/daemon.sh" stop || true
+  fi
+
+  /bin/launchctl bootout "system/$DNS_LABEL" >/dev/null 2>&1 || true
+  /bin/launchctl disable "system/$DNS_LABEL"
+}
+
+disable_command() {
+  require_root disable
+  disable_internal
+  print -- "ZoogCNBypass disabled. ZoogVPN itself was not disconnected."
+}
+
+uninstall_command() {
+  require_root uninstall
+  disable_internal
+
+  /bin/unlink "$ROUTE_PLIST" 2>/dev/null || true
+  /bin/unlink "$DNS_PLIST" 2>/dev/null || true
+  /bin/unlink "$INSTALL_DIR/daemon.sh" 2>/dev/null || true
+  /bin/unlink "$INSTALL_DIR/cn-ipv4.txt" 2>/dev/null || true
+  /bin/unlink "$INSTALL_DIR/cn-ipv6.txt" 2>/dev/null || true
+  /bin/unlink "$INSTALL_DIR/dnsmasq.conf" 2>/dev/null || true
+  /bin/unlink "$INSTALL_DIR/accelerated-domains.china.conf" 2>/dev/null || true
+  /bin/unlink "$INSTALL_DIR/apple.china.conf" 2>/dev/null || true
+  /bin/unlink "$INSTALL_DIR/dnsmasq" 2>/dev/null || true
+  /bin/unlink "$INSTALL_DIR/VERSION" 2>/dev/null || true
+  /bin/rmdir "$INSTALL_DIR" 2>/dev/null || true
+  /bin/unlink /usr/local/bin/zoog-cn-bypass 2>/dev/null || true
+
+  print -- "ZoogCNBypass uninstalled. Homebrew dnsmasq was left installed."
+}
+
+usage() {
+  print -- "Usage: zoog-cn-bypass <command>"
+  print -- ""
+  print -- "Commands:"
+  print -- "  enable      Enable automatic China-direct routing and split DNS"
+  print -- "  disable     Disable it persistently without disconnecting ZoogVPN"
+  print -- "  status      Show services, routes, DNS, and live routing checks"
+  print -- "  uninstall   Remove the helper, routes, DNS override, and services"
+  print -- "  version     Print the installed version"
+}
+
+case "${1:-}" in
+  enable)
+    enable_command
+    ;;
+  disable)
+    disable_command
+    ;;
+  status)
+    status_command
+    ;;
+  uninstall)
+    uninstall_command
+    ;;
+  version|--version|-v)
+    print -- "$VERSION"
+    ;;
+  help|--help|-h|"")
+    usage
+    ;;
+  *)
+    print -u 2 -- "Unknown command: $1"
+    usage >&2
+    exit 64
+    ;;
+esac
