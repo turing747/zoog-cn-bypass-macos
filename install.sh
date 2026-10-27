@@ -1,20 +1,14 @@
-#!/bin/zsh
+#!/bin/zsh -f
 
 set -euo pipefail
 umask 022
 
-readonly REPOSITORY="SkyHro/zoog-cn-bypass-macos"
-readonly REF="${ZOOG_CN_BYPASS_REF:-main}"
-readonly SCRIPT_DIR="${0:A:h}"
-temporary_dir=""
-source_directory=""
+unset IFS CDPATH ENV BASH_ENV ZDOTDIR DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH LD_PRELOAD
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+export LC_ALL=C
 
-cleanup() {
-  if [[ -n "$temporary_dir" && "$temporary_dir" == /tmp/zoog-cn-bypass-install.* && -d "$temporary_dir" ]]; then
-    /bin/rm -rf -- "$temporary_dir"
-  fi
-}
-trap cleanup EXIT INT TERM
+readonly SCRIPT_DIR="${0:A:h}"
+source_directory=""
 
 locate_dnsmasq() {
   local candidate
@@ -43,26 +37,12 @@ locate_brew() {
 }
 
 prepare_source() {
-  local archive
-
-  if [[ -r "$SCRIPT_DIR/scripts/install-local.sh" ]]; then
-    source_directory="$SCRIPT_DIR"
-    return 0
-  fi
-
-  temporary_dir="$(/usr/bin/mktemp -d /tmp/zoog-cn-bypass-install.XXXXXX)"
-  archive="$temporary_dir/source.tar.gz"
-  print -u 2 -- "Downloading $REPOSITORY ($REF)..."
-  /usr/bin/curl --proto '=https' --tlsv1.2 -fL --retry 3 --connect-timeout 15 \
-    "https://codeload.github.com/$REPOSITORY/tar.gz/refs/heads/$REF" \
-    -o "$archive"
-  /usr/bin/tar -xzf "$archive" -C "$temporary_dir"
-
-  source_directory="$(/usr/bin/find "$temporary_dir" -mindepth 1 -maxdepth 1 -type d -name 'zoog-cn-bypass-macos-*' | /usr/bin/head -n 1)"
-  if [[ -z "$source_directory" || ! -r "$source_directory/scripts/install-local.sh" ]]; then
-    print -u 2 -- "Downloaded archive does not contain the expected installer."
+  if [[ -L "$SCRIPT_DIR/scripts/install-local.sh" || ! -r "$SCRIPT_DIR/scripts/install-local.sh" ]]; then
+    print -u 2 -- "Local installer scripts/install-local.sh not found in $SCRIPT_DIR."
+    print -u 2 -- "Remote code download is disabled for security. Run ./install.sh from a local repository checkout."
     return 65
   fi
+  source_directory="$SCRIPT_DIR"
 }
 
 run_privileged_installer() {
@@ -71,7 +51,7 @@ run_privileged_installer() {
   local installer="$source_directory/scripts/install-local.sh"
 
   if [[ "$(/usr/bin/id -u)" -eq 0 ]]; then
-    /bin/zsh "$installer" "$source_directory" "$dnsmasq_path"
+    /bin/zsh -f "$installer" "$source_directory" "$dnsmasq_path"
     return
   fi
 
@@ -80,7 +60,7 @@ run_privileged_installer() {
     -e 'set installerPath to item 1 of argv' \
     -e 'set sourcePath to item 2 of argv' \
     -e 'set dnsmasqPath to item 3 of argv' \
-    -e 'return do shell script ("/bin/zsh " & quoted form of installerPath & " " & quoted form of sourcePath & " " & quoted form of dnsmasqPath) with administrator privileges' \
+    -e 'return do shell script ("/bin/zsh -f " & quoted form of installerPath & " " & quoted form of sourcePath & " " & quoted form of dnsmasqPath) with administrator privileges' \
     -e 'end run' \
     -- "$installer" "$source_directory" "$dnsmasq_path"
 }

@@ -21,6 +21,11 @@ def generate(source: Path) -> tuple[list[ipaddress.IPv4Network], list[ipaddress.
     ipv4: set[ipaddress.IPv4Network] = set()
     ipv6: set[ipaddress.IPv6Network] = set()
 
+    protected_v4 = (
+        ipaddress.IPv4Network("1.1.1.1/32"),
+        ipaddress.IPv4Network("8.8.8.8/32"),
+    )
+
     for raw_line in source.read_text(encoding="utf-8").splitlines():
         if not raw_line or raw_line.startswith("#"):
             continue
@@ -34,9 +39,17 @@ def generate(source: Path) -> tuple[list[ipaddress.IPv4Network], list[ipaddress.
         if resource_type == "ipv4":
             first = ipaddress.IPv4Address(start)
             last = ipaddress.IPv4Address(int(first) + int(value) - 1)
-            ipv4.update(ipaddress.summarize_address_range(first, last))
+            for net in ipaddress.summarize_address_range(first, last):
+                if (
+                    net.is_global
+                    and 8 <= net.prefixlen <= 32
+                    and not any(net.overlaps(p) for p in protected_v4)
+                ):
+                    ipv4.add(net)
         elif resource_type == "ipv6":
-            ipv6.add(ipaddress.IPv6Network(f"{start}/{value}", strict=False))
+            net6 = ipaddress.IPv6Network(f"{start}/{value}", strict=False)
+            if net6.is_global and 16 <= net6.prefixlen <= 128:
+                ipv6.add(net6)
 
     collapsed_ipv4 = ipaddress.collapse_addresses(ipv4)
     collapsed_ipv6 = ipaddress.collapse_addresses(ipv6)

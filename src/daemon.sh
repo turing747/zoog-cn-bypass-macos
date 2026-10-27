@@ -1,17 +1,26 @@
-#!/bin/zsh
+#!/bin/zsh -f
 
 set -u
 umask 022
+
+unset IFS CDPATH ENV BASH_ENV ZDOTDIR DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH LD_PRELOAD
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+export LC_ALL=C
+
+if [[ "$(/usr/bin/id -u)" -ne 0 ]]; then
+  exit 77
+fi
 
 readonly LABEL="com.local.zoog-cn-bypass"
 readonly INSTALL_DIR="/Library/Application Support/ZoogCNBypass"
 readonly ROUTES_V4="$INSTALL_DIR/cn-ipv4.txt"
 readonly ROUTES_V6="$INSTALL_DIR/cn-ipv6.txt"
-readonly STATE_FILE="/var/run/$LABEL.state"
-readonly ACTIVE_V4="/var/run/$LABEL.active-v4"
-readonly ACTIVE_V6="/var/run/$LABEL.active-v6"
-readonly ERROR_FILE="/var/run/$LABEL.error"
-readonly LOCK_FILE="/var/run/$LABEL.lock"
+readonly RUN_DIR="/var/run/$LABEL"
+readonly STATE_FILE="$RUN_DIR/state"
+readonly ACTIVE_V4="$RUN_DIR/active-v4"
+readonly ACTIVE_V6="$RUN_DIR/active-v6"
+readonly ERROR_FILE="$RUN_DIR/error"
+readonly LOCK_FILE="$RUN_DIR/lock"
 readonly VPN_SERVICE="ZoogVPN"
 readonly DNS_STATE_KEY="State:/Network/Service/com.local.zoog-cn-bypass/DNS"
 readonly LOCAL_DNS="127.0.0.1"
@@ -20,10 +29,57 @@ log_message() {
   /usr/bin/logger -t ZoogCNBypass -- "$1"
 }
 
+ensure_run_dir() {
+  if [[ -L "$RUN_DIR" ]]; then
+    log_message "Security error: $RUN_DIR is a symlink"
+    exit 65
+  fi
+  if [[ ! -d "$RUN_DIR" ]]; then
+    /usr/bin/install -d -o root -g wheel -m 0755 "$RUN_DIR" || exit 65
+  fi
+  if [[ "$(/usr/bin/stat -f '%u:%Lp' "$RUN_DIR" 2>/dev/null)" != "0:755" ]]; then
+    log_message "Security error: $RUN_DIR has invalid ownership or permissions"
+    exit 65
+  fi
+}
+
+verify_safe_file() {
+  local file_path="$1"
+
+  [[ -f "$file_path" && ! -L "$file_path" ]] || return 1
+  [[ "$(/usr/bin/stat -f '%u:%Lp' "$file_path" 2>/dev/null)" == "0:644" ]]
+}
+
+valid_ipv4_gateway() {
+  [[ "$1" =~ ^[0-9]{1,3}([.]([0-9]{1,3})){3}$ ]]
+}
+
+valid_ipv6_gateway() {
+  [[ "$1" =~ ^fe80:[0-9a-fA-F:%A-Za-z0-9._-]+$ ]]
+}
+
+valid_interface() {
+  [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+valid_ipv4_cidr() {
+  local cidr="$1"
+
+  [[ "$cidr" =~ ^[0-9]{1,3}([.]([0-9]{1,3})){3}/([89]|[12][0-9]|3[0-2])$ ]] || return 1
+  [[ ! "$cidr" =~ ^(0[.]|10[.]|127[.]|169[.]254[.]|192[.]168[.]|172[.](1[6-9]|2[0-9]|3[0-1])[.]|100[.](6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])[.]|1[.]1[.]1[.]|8[.]8[.]8[.]) ]]
+}
+
+valid_ipv6_cidr() {
+  [[ "$1" =~ ^[23][0-9a-fA-F:]+/(1[6-9]|[2-9][0-9]|1[01][0-9]|12[0-8])$ ]]
+}
+
 log_once() {
   local message="$1"
   local previous=""
 
+  if [[ -L "$ERROR_FILE" ]]; then
+    /bin/unlink "$ERROR_FILE" 2>/dev/null || true
+  fi
   if [[ -r "$ERROR_FILE" ]]; then
     previous="$(<"$ERROR_FILE")"
   fi
@@ -34,14 +90,18 @@ log_once() {
 }
 
 clear_error() {
-  if [[ -e "$ERROR_FILE" ]]; then
+  if [[ -e "$ERROR_FILE" || -L "$ERROR_FILE" ]]; then
     /bin/unlink "$ERROR_FILE" 2>/dev/null || true
   fi
 }
 
 acquire_lock() {
+  ensure_run_dir
+  if [[ -L "$LOCK_FILE" ]]; then
+    /bin/unlink "$LOCK_FILE" 2>/dev/null || exit 0
+  fi
   /usr/bin/shlock -p $$ -f "$LOCK_FILE" || exit 0
-  trap '/bin/unlink "/var/run/com.local.zoog-cn-bypass.lock" 2>/dev/null || true' EXIT INT TERM
+  trap '/bin/unlink "$LOCK_FILE" 2>/dev/null || true' EXIT INT TERM
 }
 
 zoog_is_connected() {
@@ -157,21 +217,23 @@ ensure_dns_override() {
 remove_recorded_routes() {
   local network
 
-  if [[ -r "$ACTIVE_V4" ]]; then
+  if [[ ! -L "$ACTIVE_V4" && -r "$ACTIVE_V4" ]]; then
     while IFS= read -r network; do
       [[ -n "$network" ]] || continue
+      valid_ipv4_cidr "$network" || continue
       /sbin/route -n delete -net "$network" >/dev/null 2>&1 || true
     done < "$ACTIVE_V4"
-    /bin/unlink "$ACTIVE_V4" 2>/dev/null || true
   fi
+  /bin/unlink "$ACTIVE_V4" 2>/dev/null || true
 
-  if [[ -r "$ACTIVE_V6" ]]; then
+  if [[ ! -L "$ACTIVE_V6" && -r "$ACTIVE_V6" ]]; then
     while IFS= read -r network; do
       [[ -n "$network" ]] || continue
+      valid_ipv6_cidr "$network" || continue
       /sbin/route -n delete -inet6 -net "$network" >/dev/null 2>&1 || true
     done < "$ACTIVE_V6"
-    /bin/unlink "$ACTIVE_V6" 2>/dev/null || true
   fi
+  /bin/unlink "$ACTIVE_V6" 2>/dev/null || true
 
   /bin/unlink "$STATE_FILE" 2>/dev/null || true
 }
@@ -180,10 +242,15 @@ add_ipv4_routes() {
   local gateway="$1"
   local network
 
+  valid_ipv4_gateway "$gateway" || return 1
+  verify_safe_file "$ROUTES_V4" || return 1
+
+  /bin/unlink "$ACTIVE_V4" 2>/dev/null || true
   : >| "$ACTIVE_V4"
   exec 3> "$ACTIVE_V4"
   while IFS= read -r network; do
     [[ -n "$network" ]] || continue
+    valid_ipv4_cidr "$network" || continue
     if /sbin/route -n add -net "$network" "$gateway" >/dev/null 2>&1; then
       print -u 3 -r -- "$network"
     fi
@@ -195,10 +262,15 @@ add_ipv6_routes() {
   local gateway="$1"
   local network
 
+  valid_ipv6_gateway "$gateway" || return 1
+  verify_safe_file "$ROUTES_V6" || return 1
+
+  /bin/unlink "$ACTIVE_V6" 2>/dev/null || true
   : >| "$ACTIVE_V6"
   exec 3> "$ACTIVE_V6"
   while IFS= read -r network; do
     [[ -n "$network" ]] || continue
+    valid_ipv6_cidr "$network" || continue
     if /sbin/route -n add -inet6 -net "$network" "$gateway" >/dev/null 2>&1; then
       print -u 3 -r -- "$network"
     fi
@@ -211,7 +283,7 @@ routes_are_current() {
   local interface_v4="$2"
   local interface_v6="$3"
 
-  [[ -r "$STATE_FILE" && "$(<"$STATE_FILE")" == "$expected_state" ]] || return 1
+  [[ ! -L "$STATE_FILE" && -r "$STATE_FILE" && "$(<"$STATE_FILE")" == "$expected_state" ]] || return 1
   routes_are_current_without_state "$interface_v4" "$interface_v6"
 }
 
@@ -232,6 +304,7 @@ write_state() {
   local state="$1"
   local temporary="$STATE_FILE.$$"
 
+  /bin/unlink "$temporary" 2>/dev/null || true
   print -r -- "$state" >| "$temporary"
   /bin/chmod 0644 "$temporary"
   /bin/mv -f "$temporary" "$STATE_FILE"
@@ -266,10 +339,20 @@ reconcile() {
   ipv4_gateway="${ipv4_info%%|*}"
   ipv4_interface="${ipv4_info##*|}"
 
+  if ! valid_ipv4_gateway "$ipv4_gateway" || ! valid_interface "$ipv4_interface"; then
+    clear_dns_override
+    log_once "Invalid physical IPv4 gateway or interface format"
+    return 1
+  fi
+
   ipv6_info="$(physical_ipv6_route)"
   if [[ -n "$ipv6_info" ]]; then
     ipv6_gateway="${ipv6_info%%|*}"
     ipv6_interface="${ipv6_info##*|}"
+    if ! valid_ipv6_gateway "$ipv6_gateway" || ! valid_interface "$ipv6_interface"; then
+      ipv6_gateway=""
+      ipv6_interface=""
+    fi
   fi
 
   expected_state="$ipv4_gateway|$ipv4_interface|$ipv6_gateway|$ipv6_interface"
