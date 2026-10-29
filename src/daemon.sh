@@ -22,10 +22,16 @@ readonly ACTIVE_V6="$RUN_DIR/active-v6"
 readonly ERROR_FILE="$RUN_DIR/error"
 readonly LOCK_FILE="$RUN_DIR/lock"
 readonly WORK_DIR="$RUN_DIR/chunks"
-readonly ROUTE_JOBS=8
+# Parallel route worker tuning (see compute_route_jobs).
+readonly MAX_ROUTE_JOBS=32
+readonly MIN_ROUTES_PER_JOB=64
+readonly CHUNKS_PER_JOB=4
 readonly VPN_SERVICE="ZoogVPN"
 readonly DNS_STATE_KEY="State:/Network/Service/com.local.zoog-cn-bypass/DNS"
 readonly LOCAL_DNS="127.0.0.1"
+
+# Fractional seconds for timing route operations.
+typeset -F SECONDS
 
 log_message() {
   /usr/bin/logger -t ZoogCNBypass -- "$1"
@@ -228,66 +234,122 @@ ensure_dns_override() {
   log_message "China split DNS active on $LOCAL_DNS"
 }
 
+# Deletes exactly the routes recorded in the active files, in parallel. If the
+# run is interrupted, terminate() exits before the files are unlinked, so the
+# next run retries the whole list (deleting an absent route is harmless).
 remove_recorded_routes() {
-  local network
-
   if [[ ! -L "$ACTIVE_V4" && -r "$ACTIVE_V4" ]]; then
-    while IFS= read -r network; do
-      [[ -n "$network" ]] || continue
-      valid_ipv4_cidr "$network" || continue
-      /sbin/route -n delete -net "$network" >/dev/null 2>&1 || true
-    done < "$ACTIVE_V4"
+    run_routes_parallel delete ipv4 "" "$ACTIVE_V4" ""
   fi
   /bin/unlink "$ACTIVE_V4" 2>/dev/null || true
 
   if [[ ! -L "$ACTIVE_V6" && -r "$ACTIVE_V6" ]]; then
-    while IFS= read -r network; do
-      [[ -n "$network" ]] || continue
-      valid_ipv6_cidr "$network" || continue
-      /sbin/route -n delete -inet6 -net "$network" >/dev/null 2>&1 || true
-    done < "$ACTIVE_V6"
+    run_routes_parallel delete ipv6 "" "$ACTIVE_V6" ""
   fi
   /bin/unlink "$ACTIVE_V6" 2>/dev/null || true
 
   /bin/unlink "$STATE_FILE" 2>/dev/null || true
 }
 
-# Adds every valid prefix from $3 via gateway $2 using ROUTE_JOBS parallel
-# workers. Each worker appends only the prefixes that /sbin/route accepted to
-# $4, so the file always lists exactly the routes this tool installed (and
+# Picks the number of parallel route workers for <count> routes.
+#
+# Each route change is a fork/exec of /sbin/route, so throughput scales with
+# the CPU cores that are actually free and flattens once they are saturated
+# (measured: gains stop around the number of idle cores). Therefore:
+#   jobs = online cores - 1-minute load average (rounded)
+# bounded below by max(2, cores/4) so a busy machine still makes progress,
+# bounded above by the core count and MAX_ROUTE_JOBS, and never more than one
+# worker per MIN_ROUTES_PER_JOB routes (small lists are not worth forking for).
+compute_route_jobs() {
+  local count="$1"
+  local cpus load jobs floor by_work
+
+  cpus="$(/usr/sbin/sysctl -n hw.activecpu 2>/dev/null)"
+  if [[ "$cpus" != <-> ]] || (( cpus < 1 )); then
+    cpus="$(/usr/sbin/sysctl -n hw.ncpu 2>/dev/null)"
+  fi
+  if [[ "$cpus" != <-> ]] || (( cpus < 1 )); then
+    cpus=4
+  fi
+
+  # vm.loadavg looks like "{ 6.21 8.54 6.39 }".
+  load="$(/usr/sbin/sysctl -n vm.loadavg 2>/dev/null | /usr/bin/awk '{ printf "%d", $2 + 0.5 }')"
+  [[ "$load" == <-> ]] || load=0
+
+  jobs=$(( cpus - load ))
+  floor=$(( cpus / 4 ))
+  (( floor < 2 )) && floor=2
+  (( jobs < floor )) && jobs=$floor
+  (( jobs > cpus )) && jobs=$cpus
+  (( jobs > MAX_ROUTE_JOBS )) && jobs=$MAX_ROUTE_JOBS
+
+  by_work=$(( (count + MIN_ROUTES_PER_JOB - 1) / MIN_ROUTES_PER_JOB ))
+  (( jobs > by_work )) && jobs=$by_work
+  (( jobs < 1 )) && jobs=1
+
+  print -r -- "$jobs"
+}
+
+# Worker: repeatedly claims a chunk from the queue directory $4 and applies $1
+# (add|delete) to every prefix in it. Claiming is an atomic rename into the
+# sibling "claimed" directory (outside the queue glob), so each chunk is
+# processed by exactly one worker, and faster workers (e.g. on
+# performance cores) simply take more chunks instead of waiting on a slow one.
+# For "add", only prefixes that /sbin/route accepted are appended to $5, so the
+# active file always lists exactly the routes this tool installed (and
 # therefore the only ones it may delete later).
-add_route_chunk() {
-  local family="$1"
-  local gateway="$2"
-  local chunk="$3"
-  local active_file="$4"
-  local network stop=0
+route_chunk_worker() {
+  local action="$1"
+  local family="$2"
+  local gateway="$3"
+  local queue_dir="$4"
+  local record_file="$5"
+  local network chunk claimed stop=0
   local -a family_flag=()
 
   [[ "$family" == ipv6 ]] && family_flag=(-inet6)
 
   # Do not inherit the parent's lock-release/terminate traps. On TERM finish
-  # the current route and record it before stopping, so nothing is leaked.
+  # the current route (and record it) before stopping, so nothing is leaked.
   trap - EXIT INT
   trap 'stop=1' TERM
-  exec 3>>"$active_file"
-  while (( ! stop )) && IFS= read -r network; do
-    if /sbin/route -n add "${family_flag[@]}" -net "$network" "$gateway" >/dev/null 2>&1; then
-      print -u 3 -r -- "$network"
-    fi
-  done < "$chunk"
-  exec 3>&-
+
+  [[ "$action" == add ]] && exec 3>>"$record_file"
+  for chunk in "$queue_dir"/part.*(N); do
+    (( stop )) && break
+    claimed="${queue_dir:h}/claimed/${chunk:t}"
+    /bin/mv "$chunk" "$claimed" 2>/dev/null || continue
+
+    while (( ! stop )) && IFS= read -r network; do
+      if [[ "$action" == add ]]; then
+        if /sbin/route -n add "${family_flag[@]}" -net "$network" "$gateway" >/dev/null 2>&1; then
+          print -u 3 -r -- "$network"
+        fi
+      else
+        /sbin/route -n delete "${family_flag[@]}" -net "$network" >/dev/null 2>&1 || true
+      fi
+    done < "$claimed"
+  done
+  [[ "$action" == add ]] && exec 3>&-
+  return 0
 }
 
-add_routes_parallel() {
-  local family="$1"
-  local gateway="$2"
-  local source_file="$3"
-  local active_file="$4"
-  local network count per_chunk chunk
+# run_routes_parallel <add|delete> <ipv4|ipv6> <gateway> <source> <record_file>
+# Validates every prefix in <source>, splits the list into a queue of small
+# chunks and lets compute_route_jobs() workers drain it concurrently.
+run_routes_parallel() {
+  local action="$1"
+  local family="$2"
+  local gateway="$3"
+  local source_file="$4"
+  local record_file="$5"
+  local network count jobs chunk_lines worker
+  local started="$SECONDS"
 
-  /bin/unlink "$active_file" 2>/dev/null || true
-  : >| "$active_file"
+  if [[ "$action" == add ]]; then
+    /bin/unlink "$record_file" 2>/dev/null || true
+    : >| "$record_file"
+  fi
 
   /bin/rm -rf -- "$WORK_DIR"
   /usr/bin/install -d -o root -g wheel -m 0700 "$WORK_DIR" || return 1
@@ -300,16 +362,21 @@ add_routes_parallel() {
 
   count="$(/usr/bin/wc -l < "$WORK_DIR/list" | /usr/bin/tr -d ' ')"
   if (( count > 0 )); then
-    per_chunk=$(( (count + ROUTE_JOBS - 1) / ROUTE_JOBS ))
-    /usr/bin/split -l "$per_chunk" "$WORK_DIR/list" "$WORK_DIR/part."
+    jobs="$(compute_route_jobs "$count")"
+    chunk_lines=$(( (count + jobs * CHUNKS_PER_JOB - 1) / (jobs * CHUNKS_PER_JOB) ))
+    /usr/bin/install -d -o root -g wheel -m 0700 "$WORK_DIR/queue" "$WORK_DIR/claimed" || return 1
+    /usr/bin/split -l "$chunk_lines" "$WORK_DIR/list" "$WORK_DIR/queue/part."
 
     worker_pids=()
-    for chunk in "$WORK_DIR"/part.*(N); do
-      add_route_chunk "$family" "$gateway" "$chunk" "$active_file" &
+    for (( worker = 0; worker < jobs; worker++ )); do
+      route_chunk_worker "$action" "$family" "$gateway" "$WORK_DIR/queue" "$record_file" &
       worker_pids+=($!)
     done
     wait "${worker_pids[@]}" 2>/dev/null || true
     worker_pids=()
+
+    log_message "$(/usr/bin/printf '%s %d %s routes with %d workers in %.2fs' \
+      "${(C)action}" "$count" "$family" "$jobs" "$(( SECONDS - started ))")"
   fi
 
   /bin/rm -rf -- "$WORK_DIR"
@@ -321,7 +388,7 @@ add_ipv4_routes() {
   valid_ipv4_gateway "$gateway" || return 1
   verify_safe_file "$ROUTES_V4" || return 1
 
-  add_routes_parallel ipv4 "$gateway" "$ROUTES_V4" "$ACTIVE_V4"
+  run_routes_parallel add ipv4 "$gateway" "$ROUTES_V4" "$ACTIVE_V4"
 }
 
 add_ipv6_routes() {
@@ -330,7 +397,7 @@ add_ipv6_routes() {
   valid_ipv6_gateway "$gateway" || return 1
   verify_safe_file "$ROUTES_V6" || return 1
 
-  add_routes_parallel ipv6 "$gateway" "$ROUTES_V6" "$ACTIVE_V6"
+  run_routes_parallel add ipv6 "$gateway" "$ROUTES_V6" "$ACTIVE_V6"
 }
 
 routes_are_current() {
