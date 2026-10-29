@@ -159,15 +159,26 @@ require_root() {
   fi
 }
 
+# Loading the service already starts it (RunAtLoad), so kickstarting right
+# after a fresh bootstrap would only kill and redo the first run.
+# $3 = "restart" forces a restart of an already-loaded service; otherwise an
+# already-loaded service is only started if it is not currently running.
 bootstrap_service() {
   local label="$1"
   local plist="$2"
+  local mode="${3:-}"
 
   /bin/launchctl enable "system/$label"
   if ! service_is_loaded "$label"; then
     /bin/launchctl bootstrap system "$plist"
+    return
   fi
-  /bin/launchctl kickstart -k "system/$label"
+
+  if [[ "$mode" == "restart" ]]; then
+    /bin/launchctl kickstart -k "system/$label"
+  else
+    /bin/launchctl kickstart "system/$label" >/dev/null 2>&1 || true
+  fi
 }
 
 wait_for_dns() {
@@ -203,7 +214,7 @@ enable_command() {
   fi
 
   "$INSTALL_DIR/dnsmasq" --test --conf-file="$INSTALL_DIR/dnsmasq.conf" >/dev/null
-  bootstrap_service "$DNS_LABEL" "$DNS_PLIST"
+  bootstrap_service "$DNS_LABEL" "$DNS_PLIST" restart
   if ! wait_for_dns; then
     print -u 2 -- "The local DNS service did not become ready."
     return 1

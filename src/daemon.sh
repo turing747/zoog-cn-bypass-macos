@@ -95,13 +95,11 @@ clear_error() {
   fi
 }
 
-acquire_lock() {
-  ensure_run_dir
-  if [[ -L "$LOCK_FILE" ]]; then
-    /bin/unlink "$LOCK_FILE" 2>/dev/null || exit 0
-  fi
-  /usr/bin/shlock -p $$ -f "$LOCK_FILE" || exit 0
-  trap '/bin/unlink "$LOCK_FILE" 2>/dev/null || true' EXIT INT TERM
+# Lock handling lives at the top level of the script (see the bottom of this
+# file). In zsh an EXIT trap set inside a function fires as soon as that
+# function returns, which would release the lock immediately.
+release_lock() {
+  /bin/unlink "$LOCK_FILE" 2>/dev/null || true
 }
 
 zoog_is_connected() {
@@ -397,7 +395,6 @@ reconcile() {
 }
 
 main() {
-  acquire_lock
   case "${1:-reconcile}" in
     reconcile)
       reconcile
@@ -413,5 +410,37 @@ main() {
       ;;
   esac
 }
+
+case "${1:-reconcile}" in
+  reconcile|stop) ;;
+  *)
+    print -u 2 -- "Usage: $0 [reconcile|stop]"
+    exit 64
+    ;;
+esac
+
+ensure_run_dir
+if [[ -L "$LOCK_FILE" ]]; then
+  /bin/unlink "$LOCK_FILE" 2>/dev/null || exit 0
+fi
+
+# "stop" must not silently do nothing while a reconcile run holds the lock, so
+# it waits briefly; a periodic "reconcile" simply yields to the running one.
+lock_attempts=1
+[[ "${1:-reconcile}" == "stop" ]] && lock_attempts=15
+until /usr/bin/shlock -p $$ -f "$LOCK_FILE"; do
+  (( --lock_attempts > 0 )) || {
+    [[ "${1:-reconcile}" == "stop" ]] && exit 75
+    exit 0
+  }
+  /bin/sleep 1
+done
+
+# Only installed after the lock is held, so a losing instance never removes
+# another instance's lock. TERM/INT must exit explicitly: in zsh a trap handler
+# otherwise returns and the script keeps running (launchd would then SIGKILL it).
+trap release_lock EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 main "$@"
