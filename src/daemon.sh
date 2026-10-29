@@ -21,6 +21,8 @@ readonly ACTIVE_V4="$RUN_DIR/active-v4"
 readonly ACTIVE_V6="$RUN_DIR/active-v6"
 readonly ERROR_FILE="$RUN_DIR/error"
 readonly LOCK_FILE="$RUN_DIR/lock"
+readonly WORK_DIR="$RUN_DIR/chunks"
+readonly ROUTE_JOBS=8
 readonly VPN_SERVICE="ZoogVPN"
 readonly DNS_STATE_KEY="State:/Network/Service/com.local.zoog-cn-bypass/DNS"
 readonly LOCAL_DNS="127.0.0.1"
@@ -99,7 +101,21 @@ clear_error() {
 # file). In zsh an EXIT trap set inside a function fires as soon as that
 # function returns, which would release the lock immediately.
 release_lock() {
+  /bin/rm -rf -- "$WORK_DIR" 2>/dev/null || true
   /bin/unlink "$LOCK_FILE" 2>/dev/null || true
+}
+
+# PIDs of the parallel route workers; terminate() reaps them before exiting so
+# no worker keeps adding routes after the lock is released.
+typeset -a worker_pids=()
+
+terminate() {
+  if (( ${#worker_pids} > 0 )); then
+    kill -TERM "${worker_pids[@]}" 2>/dev/null || true
+    wait "${worker_pids[@]}" 2>/dev/null || true
+    worker_pids=()
+  fi
+  exit 143
 }
 
 zoog_is_connected() {
@@ -236,44 +252,85 @@ remove_recorded_routes() {
   /bin/unlink "$STATE_FILE" 2>/dev/null || true
 }
 
+# Adds every valid prefix from $3 via gateway $2 using ROUTE_JOBS parallel
+# workers. Each worker appends only the prefixes that /sbin/route accepted to
+# $4, so the file always lists exactly the routes this tool installed (and
+# therefore the only ones it may delete later).
+add_route_chunk() {
+  local family="$1"
+  local gateway="$2"
+  local chunk="$3"
+  local active_file="$4"
+  local network stop=0
+  local -a family_flag=()
+
+  [[ "$family" == ipv6 ]] && family_flag=(-inet6)
+
+  # Do not inherit the parent's lock-release/terminate traps. On TERM finish
+  # the current route and record it before stopping, so nothing is leaked.
+  trap - EXIT INT
+  trap 'stop=1' TERM
+  exec 3>>"$active_file"
+  while (( ! stop )) && IFS= read -r network; do
+    if /sbin/route -n add "${family_flag[@]}" -net "$network" "$gateway" >/dev/null 2>&1; then
+      print -u 3 -r -- "$network"
+    fi
+  done < "$chunk"
+  exec 3>&-
+}
+
+add_routes_parallel() {
+  local family="$1"
+  local gateway="$2"
+  local source_file="$3"
+  local active_file="$4"
+  local network count per_chunk chunk
+
+  /bin/unlink "$active_file" 2>/dev/null || true
+  : >| "$active_file"
+
+  /bin/rm -rf -- "$WORK_DIR"
+  /usr/bin/install -d -o root -g wheel -m 0700 "$WORK_DIR" || return 1
+
+  while IFS= read -r network; do
+    [[ -n "$network" ]] || continue
+    "valid_${family}_cidr" "$network" || continue
+    print -r -- "$network"
+  done < "$source_file" >| "$WORK_DIR/list"
+
+  count="$(/usr/bin/wc -l < "$WORK_DIR/list" | /usr/bin/tr -d ' ')"
+  if (( count > 0 )); then
+    per_chunk=$(( (count + ROUTE_JOBS - 1) / ROUTE_JOBS ))
+    /usr/bin/split -l "$per_chunk" "$WORK_DIR/list" "$WORK_DIR/part."
+
+    worker_pids=()
+    for chunk in "$WORK_DIR"/part.*(N); do
+      add_route_chunk "$family" "$gateway" "$chunk" "$active_file" &
+      worker_pids+=($!)
+    done
+    wait "${worker_pids[@]}" 2>/dev/null || true
+    worker_pids=()
+  fi
+
+  /bin/rm -rf -- "$WORK_DIR"
+}
+
 add_ipv4_routes() {
   local gateway="$1"
-  local network
 
   valid_ipv4_gateway "$gateway" || return 1
   verify_safe_file "$ROUTES_V4" || return 1
 
-  /bin/unlink "$ACTIVE_V4" 2>/dev/null || true
-  : >| "$ACTIVE_V4"
-  exec 3> "$ACTIVE_V4"
-  while IFS= read -r network; do
-    [[ -n "$network" ]] || continue
-    valid_ipv4_cidr "$network" || continue
-    if /sbin/route -n add -net "$network" "$gateway" >/dev/null 2>&1; then
-      print -u 3 -r -- "$network"
-    fi
-  done < "$ROUTES_V4"
-  exec 3>&-
+  add_routes_parallel ipv4 "$gateway" "$ROUTES_V4" "$ACTIVE_V4"
 }
 
 add_ipv6_routes() {
   local gateway="$1"
-  local network
 
   valid_ipv6_gateway "$gateway" || return 1
   verify_safe_file "$ROUTES_V6" || return 1
 
-  /bin/unlink "$ACTIVE_V6" 2>/dev/null || true
-  : >| "$ACTIVE_V6"
-  exec 3> "$ACTIVE_V6"
-  while IFS= read -r network; do
-    [[ -n "$network" ]] || continue
-    valid_ipv6_cidr "$network" || continue
-    if /sbin/route -n add -inet6 -net "$network" "$gateway" >/dev/null 2>&1; then
-      print -u 3 -r -- "$network"
-    fi
-  done < "$ROUTES_V6"
-  exec 3>&-
+  add_routes_parallel ipv6 "$gateway" "$ROUTES_V6" "$ACTIVE_V6"
 }
 
 routes_are_current() {
@@ -440,7 +497,6 @@ done
 # another instance's lock. TERM/INT must exit explicitly: in zsh a trap handler
 # otherwise returns and the script keeps running (launchd would then SIGKILL it).
 trap release_lock EXIT
-trap 'exit 143' TERM
-trap 'exit 130' INT
+trap terminate TERM INT
 
 main "$@"
