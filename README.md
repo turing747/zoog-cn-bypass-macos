@@ -1,5 +1,7 @@
 # ZoogCNBypass for macOS
 
+> **Windows 用户**：请看 [windows/README.md](windows/README.md)（命令行工具，与 macOS 版共用 `data/` 数据）。
+
 让 ZoogVPN 保持 OpenVPN 全局连接，同时让中国大陆网站和 IP 通过本地网络直连。分流依据是目标域名和 IP，不区分 App。
 
 ## 工作方式

@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 *.log
 *.tmp
+
+windows/dist/
+windows/build/
+*.spec
