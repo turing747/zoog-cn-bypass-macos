@@ -7,7 +7,7 @@ unset IFS CDPATH ENV BASH_ENV ZDOTDIR DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DY
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 export LC_ALL=C
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly ROUTE_LABEL="com.local.zoog-cn-bypass"
 readonly DNS_LABEL="com.local.zoog-cn-dns"
 readonly INSTALL_DIR="/Library/Application Support/ZoogCNBypass"
@@ -19,8 +19,30 @@ readonly RUN_DIR="/var/run/$ROUTE_LABEL"
 readonly STATE_FILE="$RUN_DIR/state"
 readonly ACTIVE_V4="$RUN_DIR/active-v4"
 readonly ACTIVE_V6="$RUN_DIR/active-v6"
+readonly ACTIVE_OVERRIDE_V4="$RUN_DIR/active-override-v4"
+readonly SUPPRESSED_PROXIES_FILE="$RUN_DIR/suppressed-proxies"
 readonly ERROR_FILE="$RUN_DIR/error"
+readonly UPSTREAM_SERVERS_FILE="$INSTALL_DIR/upstream-servers.conf"
+readonly CLASH_TUN_IP="198.18.0.1"
 readonly DNS_STATE_KEY="State:/Network/Service/com.local.zoog-cn-bypass/DNS"
+readonly CORP_DNS_KEY_PATTERN='State:/Network/Service/com[.]local[.]zoog-cn-bypass[.]corp[.][0-9]+/DNS'
+
+# Prints one "<domains> -> <server>" line per active corporate DNS resolver.
+corp_dns_status() {
+  local key
+
+  for key in $(/usr/bin/printf '%s\n' "list $CORP_DNS_KEY_PATTERN" quit | /usr/sbin/scutil 2>/dev/null \
+      | /usr/bin/awk '$NF ~ /^State:/ { print $NF }'); do
+    /usr/bin/printf '%s\n' "show $key" quit | /usr/sbin/scutil 2>/dev/null | /usr/bin/awk '
+      $1 == "ServerAddresses" { section = "server"; next }
+      $1 == "SupplementalMatchDomains" { section = "domains"; next }
+      /<array>|<dictionary>|^ *}/ { section = ""; next }
+      section == "server" && $2 == ":" && server == "" { server = $3 }
+      section == "domains" && $2 == ":" { domains = domains (domains == "" ? "" : " ") $3 }
+      END { if (server != "") print domains " -> " server }
+    '
+  done
+}
 
 service_is_loaded() {
   /bin/launchctl print "system/$1" >/dev/null 2>&1
@@ -28,6 +50,66 @@ service_is_loaded() {
 
 zoog_status() {
   /usr/sbin/scutil --nc status ZoogVPN 2>/dev/null | /usr/bin/head -n 1
+}
+
+zoog_utun_interface() {
+  local uuid iface=""
+  local utun_pattern='^utun[0-9]+$'
+
+  uuid="$(/usr/sbin/scutil --nc list 2>/dev/null | /usr/bin/awk '
+    /\(Connected\)/ && $0 ~ /"ZoogVPN"/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^[0-9A-Fa-f]{8}-([0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}$/) {
+          print $i
+          exit
+        }
+      }
+    }
+  ')"
+  if [[ -n "$uuid" ]]; then
+    iface="$(/usr/bin/printf '%s\n' "show State:/Network/Service/$uuid/IPv4" quit \
+      | /usr/sbin/scutil 2>/dev/null \
+      | /usr/bin/awk '$1 == "InterfaceName" && $2 == ":" { print $3; exit }')"
+  fi
+  if [[ ! "$iface" =~ $utun_pattern ]]; then
+    iface="$(/usr/sbin/netstat -rn -f inet | /usr/bin/awk -v clash_ip="$CLASH_TUN_IP" '
+      ($1 == "0/1" || ($1 == "default" && $3 !~ /I/)) && $NF ~ /^utun[0-9]+$/ && $2 != clash_ip {
+        print $NF
+        exit
+      }
+    ')"
+  fi
+  [[ "$iface" =~ $utun_pattern ]] && print -r -- "$iface"
+}
+
+clash_tun_interface() {
+  local iface
+  local utun_pattern='^utun[0-9]+$'
+
+  iface="$(/sbin/ifconfig 2>/dev/null | /usr/bin/awk -v clash_ip="$CLASH_TUN_IP" '
+    /^[a-z0-9]+:/ {
+      current = $1
+      sub(/:$/, "", current)
+    }
+    current ~ /^utun[0-9]+$/ && $1 == "inet" && $2 == clash_ip {
+      print current
+      exit
+    }
+  ')"
+  [[ "$iface" =~ $utun_pattern ]] || return 1
+
+  /usr/sbin/netstat -rn -f inet | /usr/bin/awk -v clash_ip="$CLASH_TUN_IP" -v target="$iface" '
+    $2 == clash_ip && $NF == target { found = 1; exit }
+    END { exit(found ? 0 : 1) }
+  ' || return 1
+
+  print -r -- "$iface"
+}
+
+upstream_dns_summary() {
+  if [[ -r "$UPSTREAM_SERVERS_FILE" ]]; then
+    /usr/bin/awk -F= '/^server=/ { list = list (list == "" ? "" : ", ") $2 } END { print list }' "$UPSTREAM_SERVERS_FILE"
+  fi
 }
 
 dns_override_is_active() {
@@ -57,11 +139,35 @@ line_count() {
 }
 
 status_command() {
-  local vpn_status route_service dns_service split_status routing_status
+  local vpn_status zoog_iface="" clash_iface="" clash_status active_tunnel
+  local route_service dns_service split_status routing_status upstream_summary
   local cn_interface foreign_interface domestic_ip foreign_ip domestic_route foreign_route
+  local corp_dns corp_line override_count suppressed_count
 
   vpn_status="$(zoog_status)"
   [[ -n "$vpn_status" ]] || vpn_status="Unavailable"
+  if [[ "$vpn_status" == "Connected" ]]; then
+    zoog_iface="$(zoog_utun_interface 2>/dev/null || true)"
+  fi
+
+  clash_iface="$(clash_tun_interface 2>/dev/null || true)"
+  if [[ -n "$clash_iface" ]]; then
+    clash_status="Connected ($clash_iface)"
+  else
+    clash_status="Disconnected"
+  fi
+
+  if [[ "$vpn_status" == "Connected" ]]; then
+    if [[ -n "$clash_iface" ]]; then
+      active_tunnel="ZoogVPN (${zoog_iface:-utun}, priority over Clash Pro $clash_iface)"
+    else
+      active_tunnel="ZoogVPN (${zoog_iface:-utun})"
+    fi
+  elif [[ -n "$clash_iface" ]]; then
+    active_tunnel="Clash Pro ($clash_iface)"
+  else
+    active_tunnel="none"
+  fi
 
   if service_is_loaded "$ROUTE_LABEL"; then
     route_service="loaded"
@@ -80,7 +186,7 @@ status_command() {
   fi
 
   if [[ -r "$STATE_FILE" ]]; then
-    if [[ "$vpn_status" == "Connected" ]]; then
+    if [[ "$vpn_status" == "Connected" || -n "$clash_iface" ]]; then
       routing_status="active"
     else
       routing_status="standby (routes retained for fast reconnect)"
@@ -89,13 +195,37 @@ status_command() {
     routing_status="inactive"
   fi
 
+  upstream_summary="$(upstream_dns_summary)"
+  override_count="$(line_count "$ACTIVE_OVERRIDE_V4")"
+  suppressed_count="$(line_count "$SUPPRESSED_PROXIES_FILE")"
+
   print -- "ZoogVPN: $vpn_status"
+  print -- "Clash Pro TUN: $clash_status"
+  print -- "Active foreign tunnel: $active_tunnel"
   print -- "Route service: $route_service"
   print -- "Local DNS service: $dns_service"
   print -- "Split DNS override: $split_status"
+  print -- "Foreign DNS upstream: ${upstream_summary:-default}"
   print -- "China-direct routing: $routing_status"
   print -- "Installed IPv4 routes: $(line_count "$ACTIVE_V4")"
   print -- "Installed IPv6 routes: $(line_count "$ACTIVE_V6")"
+  if (( override_count > 0 )); then
+    print -- "Priority override routes: $override_count"
+  fi
+  if (( suppressed_count > 0 )); then
+    print -- "Clash proxy suppression: active ($suppressed_count proxy setting suppressed)"
+  else
+    print -- "Clash proxy suppression: standby (no conflicting Clash system proxy)"
+  fi
+
+  corp_dns="$(corp_dns_status)"
+  if [[ -n "$corp_dns" ]]; then
+    for corp_line in "${(@f)corp_dns}"; do
+      print -r -- "Corporate DNS: active ($corp_line)"
+    done
+  else
+    print -- "Corporate DNS: inactive (no corporate DNS server reachable)"
+  fi
 
   if [[ -r "$ERROR_FILE" ]]; then
     print -- "Last error: $(<"$ERROR_FILE")"
@@ -159,10 +289,6 @@ require_root() {
   fi
 }
 
-# Loading the service already starts it (RunAtLoad), so kickstarting right
-# after a fresh bootstrap would only kill and redo the first run.
-# $3 = "restart" forces a restart of an already-loaded service; otherwise an
-# already-loaded service is only started if it is not currently running.
 bootstrap_service() {
   local label="$1"
   local plist="$2"
@@ -197,7 +323,7 @@ wait_for_active_split() {
   local attempt
 
   for attempt in {1..120}; do
-    if [[ -r "$STATE_FILE" ]] && dns_override_is_active; then
+    if [[ -r "$STATE_FILE" ]] && dns_override_is_active && [[ -n "$(resolve_ipv4 www.baidu.com)" ]]; then
       return 0
     fi
     /bin/sleep 1
@@ -206,6 +332,8 @@ wait_for_active_split() {
 }
 
 enable_command() {
+  local clash_iface=""
+
   require_root enable
 
   if ! verify_root_owned "$INSTALL_DIR" || ! verify_root_owned "$INSTALL_DIR/dnsmasq" || ! verify_root_owned "$INSTALL_DIR/daemon.sh"; then
@@ -215,21 +343,29 @@ enable_command() {
 
   "$INSTALL_DIR/dnsmasq" --test --conf-file="$INSTALL_DIR/dnsmasq.conf" >/dev/null
   bootstrap_service "$DNS_LABEL" "$DNS_PLIST" restart
-  if ! wait_for_dns; then
-    print -u 2 -- "The local DNS service did not become ready."
-    return 1
-  fi
+  bootstrap_service "$ROUTE_LABEL" "$ROUTE_PLIST" restart
 
-  bootstrap_service "$ROUTE_LABEL" "$ROUTE_PLIST"
+  clash_iface="$(clash_tun_interface 2>/dev/null || true)"
   if [[ "$(zoog_status)" == "Connected" ]]; then
     print -- "ZoogVPN is connected; waiting for China routes and split DNS..."
     if ! wait_for_active_split; then
       print -u 2 -- "Activation timed out. Run: zoog-cn-bypass status"
       return 1
     fi
-    print -- "ZoogCNBypass enabled and active."
+    print -- "ZoogCNBypass enabled and active (foreign tunnel: ZoogVPN)."
+  elif [[ -n "$clash_iface" ]]; then
+    print -- "Clash Pro TUN ($clash_iface) is connected; waiting for China routes and split DNS..."
+    if ! wait_for_active_split; then
+      print -u 2 -- "Activation timed out. Run: zoog-cn-bypass status"
+      return 1
+    fi
+    print -- "ZoogCNBypass enabled and active (foreign tunnel: Clash Pro $clash_iface)."
   else
-    print -- "ZoogCNBypass enabled. It will activate when ZoogVPN connects."
+    if ! wait_for_dns; then
+      print -u 2 -- "The local DNS service did not become ready."
+      return 1
+    fi
+    print -- "ZoogCNBypass enabled. It will activate when ZoogVPN or Clash Pro (Enhanced Mode) connects."
   fi
 }
 
@@ -238,7 +374,7 @@ disable_internal() {
   /bin/launchctl disable "system/$ROUTE_LABEL"
 
   if verify_root_owned "$INSTALL_DIR/daemon.sh"; then
-    print -- "Removing the recorded China routes and DNS override..."
+    print -- "Removing recorded routes, DNS overrides, and restoring proxy settings..."
     "$INSTALL_DIR/daemon.sh" stop || true
   fi
 
@@ -249,7 +385,7 @@ disable_internal() {
 disable_command() {
   require_root disable
   disable_internal
-  print -- "ZoogCNBypass disabled. ZoogVPN itself was not disconnected."
+  print -- "ZoogCNBypass disabled. ZoogVPN / Clash Pro / UniVPN connections were not disconnected."
 }
 
 uninstall_command() {
@@ -263,6 +399,8 @@ uninstall_command() {
   /bin/unlink "$INSTALL_DIR/cn-ipv4.txt" 2>/dev/null || true
   /bin/unlink "$INSTALL_DIR/cn-ipv6.txt" 2>/dev/null || true
   /bin/unlink "$INSTALL_DIR/dnsmasq.conf" 2>/dev/null || true
+  /bin/unlink "$INSTALL_DIR/upstream-servers.conf" 2>/dev/null || true
+  /bin/unlink "$INSTALL_DIR/corp-dns.conf" 2>/dev/null || true
   /bin/unlink "$INSTALL_DIR/accelerated-domains.china.conf" 2>/dev/null || true
   /bin/unlink "$INSTALL_DIR/apple.china.conf" 2>/dev/null || true
   /bin/unlink "$INSTALL_DIR/dnsmasq" 2>/dev/null || true
@@ -279,9 +417,9 @@ usage() {
   print -- "Usage: zoog-cn-bypass <command>"
   print -- ""
   print -- "Commands:"
-  print -- "  enable      Enable automatic China-direct routing and split DNS"
-  print -- "  disable     Disable it persistently without disconnecting ZoogVPN"
-  print -- "  status      Show services, routes, DNS, and live routing checks"
+  print -- "  enable      Enable automatic China-direct, UniVPN, and ZoogVPN/Clash split routing"
+  print -- "  disable     Disable persistently without disconnecting your VPNs"
+  print -- "  status      Show tunnels, services, routes, DNS, and live routing checks"
   print -- "  uninstall   Remove the helper, routes, DNS override, and services"
   print -- "  version     Print the installed version"
 }

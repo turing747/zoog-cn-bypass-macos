@@ -41,6 +41,8 @@ fi
 /usr/bin/grep -q '^server=/a1\.mzstatic\.com/223\.5\.5\.5$' "$ROOT_DIR/data/apple.china.conf"
 /usr/bin/grep -q '^user=nobody$' "$ROOT_DIR/config/dnsmasq.conf"
 /usr/bin/grep -q '^stop-dns-rebind$' "$ROOT_DIR/config/dnsmasq.conf"
+/usr/bin/grep -q '^clear-on-reload$' "$ROOT_DIR/config/dnsmasq.conf"
+/usr/bin/grep -q '^servers-file=/Library/Application Support/ZoogCNBypass/upstream-servers\.conf$' "$ROOT_DIR/config/dnsmasq.conf"
 
 for domain_file in "$ROOT_DIR/data/accelerated-domains.china.conf" "$ROOT_DIR/data/apple.china.conf"; do
   /usr/bin/awk '
@@ -49,6 +51,13 @@ for domain_file in "$ROOT_DIR/data/accelerated-domains.china.conf" "$ROOT_DIR/da
     { exit 1 }
   ' "$domain_file"
 done
+
+/usr/bin/awk '
+  /^[[:space:]]*$/ || /^#/ { next }
+  /^server=[0-9]{1,3}(\.[0-9]{1,3}){3}$/ { found = 1; next }
+  { bad = 1; exit 1 }
+  END { exit(bad || !found) }
+' "$ROOT_DIR/config/upstream-servers.conf"
 
 /usr/bin/awk '
   /^[[:space:]]*$/ { next }
@@ -63,10 +72,57 @@ done
   { exit 1 }
 ' "$ROOT_DIR/data/cn-ipv6.txt"
 
+# Ensure no China route has prefix length <= 9 so the 16 ZoogVPN override
+# routes (/9../2) never shadow a China-direct prefix.
+/usr/bin/awk -F/ '
+  /^[[:space:]]*$/ { next }
+  $2 <= 9 { exit 1 }
+' "$ROOT_DIR/data/cn-ipv4.txt"
+
+/usr/bin/awk '
+  /^[[:space:]]*$/ || /^#/ { next }
+  /^[A-Za-z0-9][A-Za-z0-9-]*(\.[A-Za-z0-9][A-Za-z0-9-]*)+[ \t]+[0-9]{1,3}(\.[0-9]{1,3}){3}[ \t]*$/ { found = 1; next }
+  { bad = 1; exit 1 }
+  END { exit(bad || !found) }
+' "$ROOT_DIR/config/corp-dns.conf"
+/usr/bin/grep -q 'ensure_corp_dns' <(/usr/bin/sed -n '/^reconcile() {/,/^}/p' "$ROOT_DIR/src/daemon.sh")
+/usr/bin/grep -q 'clear_corp_dns' "$ROOT_DIR/src/daemon.sh"
+/usr/bin/grep -q 'clash_tun_interface' "$ROOT_DIR/src/daemon.sh"
+/usr/bin/grep -q 'ensure_zoog_override_routes' "$ROOT_DIR/src/daemon.sh"
+/usr/bin/grep -q 'ensure_proxy_suppression' "$ROOT_DIR/src/daemon.sh"
+/usr/bin/grep -q 'restore_suppressed_proxies' "$ROOT_DIR/src/daemon.sh"
+
 if /usr/bin/grep -q '=~.*\\\.' "$ROOT_DIR/src/daemon.sh"; then
   print -u 2 -- "Use [.] instead of \\. inside zsh =~ regexes in src/daemon.sh"
   exit 1
 fi
+
+if /usr/bin/grep -q '=~.*\\\.' "$ROOT_DIR/bin/zoog-cn-bypass"; then
+  print -u 2 -- "Use [.] instead of \\. inside zsh =~ regexes in bin/zoog-cn-bypass"
+  exit 1
+fi
+
+# Runtime smoke checks (catches zsh regex parse errors that -n cannot detect).
+"$ROOT_DIR/bin/zoog-cn-bypass" --help >/dev/null
+[[ "$("$ROOT_DIR/bin/zoog-cn-bypass" --version)" == "$(<"$ROOT_DIR/VERSION")" ]]
+/bin/zsh -f -c '
+  eval "$(/usr/bin/awk '\''
+    /^if \[\[ "\$\(\/usr\/bin\/id -u\)" -ne 0 \]\]/,/^fi$/ { next }
+    /^case "\$\{1:-reconcile\}" in$/ { exit }
+    { print }
+  '\'' "$1")"
+  valid_ipv4_gateway "192.168.1.1"
+  ! valid_ipv4_gateway "bad"
+  valid_ipv6_gateway "fe80::1%en0"
+  valid_interface "en0"
+  valid_utun_interface "utun9"
+  ! valid_utun_interface "en0"
+  valid_service_name "Wi-Fi (en0)"
+  valid_domain "xytdt.com"
+  valid_ipv4_cidr "223.5.5.0/24"
+  ! valid_ipv4_cidr "10.0.0.0/8"
+  valid_ipv6_cidr "2400:3200::/32"
+' _ "$ROOT_DIR/src/daemon.sh"
 
 machine_home_prefix='/''Users/'
 if /usr/bin/grep -R -n "$machine_home_prefix" "$ROOT_DIR" --exclude-dir=.git; then
@@ -85,7 +141,9 @@ done
 if [[ -n "$dnsmasq" ]]; then
   temporary_conf="$(/usr/bin/mktemp /tmp/zoog-cn-dnsmasq.XXXXXX)"
   trap '/bin/unlink "$temporary_conf" 2>/dev/null || true' EXIT INT TERM
-  /usr/bin/sed "s#/Library/Application Support/ZoogCNBypass#$ROOT_DIR/data#g" \
+  /usr/bin/sed \
+    -e "s#/Library/Application Support/ZoogCNBypass/upstream-servers.conf#$ROOT_DIR/config/upstream-servers.conf#g" \
+    -e "s#/Library/Application Support/ZoogCNBypass#$ROOT_DIR/data#g" \
     "$ROOT_DIR/config/dnsmasq.conf" > "$temporary_conf"
   "$dnsmasq" --test --conf-file="$temporary_conf" >/dev/null
 fi

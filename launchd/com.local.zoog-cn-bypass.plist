@@ -11,6 +11,10 @@
   </array>
   <key>RunAtLoad</key>
   <true/>
+  <key>WatchPaths</key>
+  <array>
+    <string>/Library/Preferences/SystemConfiguration</string>
+  </array>
   <key>StartInterval</key>
   <integer>10</integer>
   <key>ThrottleInterval</key>

@@ -2,22 +2,29 @@
 
 > **Windows 用户**：请看 [windows/README.md](windows/README.md)（命令行工具，与 macOS 版共用 `data/` 数据）。
 
-让 ZoogVPN 保持 OpenVPN 全局连接，同时让中国大陆网站和 IP 通过本地网络直连。分流依据是目标域名和 IP，不区分 App。
+让 ZoogVPN 或 Clash Pro（增强模式 TUN）与公司内网 VPN（如 UniVPN）共存，同时让中国大陆网站和 IP 通过本地物理网络直连。分流依据是目标域名和 IP，不区分 App。
 
 ## 工作方式
 
-- 中国大陆 IPv4/IPv6：通过 Wi‑Fi 或以太网物理网关直连。
-- 国内域名：本机 `dnsmasq` 转发至 AliDNS `223.5.5.5`，获得国内 CDN 地址。
-- 其他域名：转发至 `1.1.1.1`/`8.8.8.8`，其请求仍通过 ZoogVPN 的 `utun` 接口。
-- ZoogVPN 断开时：自动撤销 macOS DNS 接管；重新连接后自动恢复。
+- **公司内网（UniVPN 等）**：通过 `config/corp-dns.conf` 注册 macOS 专属域名解析器，内网域名直连公司内网 DNS，内网子网流量走公司 VPN 网卡。
+- **中国大陆 IPv4/IPv6**：通过 Wi‑Fi 或以太网物理网关直连；国内域名由本机 `dnsmasq` 转发至 AliDNS `223.5.5.5`，获得国内 CDN 地址。
+- **国外公网流量（支持 ZoogVPN 与 Clash Pro 自动切换）**：
+  - **ZoogVPN 与 Clash Pro 同时连接**：国外流量优先走 **ZoogVPN**（自动下发 16 条更细前缀覆盖路由压过 Clash TUN，并将 `dnsmasq` 国外上游切至 `1.1.1.1`/`8.8.8.8`）。
+  - **仅连接 Clash Pro（增强模式 TUN）**：国外流量走 **Clash Pro**（`dnsmasq` 国外上游自动切至 Clash TUN 内置 DNS `198.18.0.2`）。
+  - **仅连接 ZoogVPN**：国外流量走 **ZoogVPN**。
+  - **两者均未连接**：自动撤销分流 DNS 接管与覆盖路由，恢复曾被压制的 Clash 系统代理；若公司 VPN 仍在线，内网域名解析继续保持可用。
+- **系统代理防冲突**：当 ZoogVPN 或 Clash TUN 分流生效时，自动检测并关闭 Clash 本机系统代理端口（如 `127.0.0.1:7890`/`7891`），防止浏览器流量绕过内核路由表与内网 DNS（不影响 Charles / Proxyman 等其他调试抓包端口）。
 - 本地 DNS 仅绑定 `lo0`（`127.0.0.1` 和 `::1`），不会开放给局域网；绑定端口后自动降权至 `nobody` 运行，并启用 `stop-dns-rebind`、`domain-needed`、`bogus-priv` 防御 DNS 重绑定攻击与内网信息泄漏。
 
-它不会读取或修改 ZoogVPN 的账号、密码和应用文件。
+它不会读取或修改 ZoogVPN / Clash Pro 的账号、密码、订阅规则和应用文件。
 
 ## 要求
 
 - macOS。
-- ZoogVPN 中存在名为 `ZoogVPN` 的网络服务，并使用 OpenVPN 连接。
+- 使用以下任一（或同时安装）：
+  - ZoogVPN（存在名为 `ZoogVPN` 的网络服务，并使用 OpenVPN 连接）；
+  - ClashX Pro / Clash 增强模式（Enhanced Mode TUN，`198.18.0.1`）。
+- 如需公司内网域名分流（如 UniVPN），可在 `config/corp-dns.conf` 配置 `<内网域名> <内网DNS_IPv4>` 后执行 `./install.sh`。
 - 已安装 [Homebrew](https://brew.sh)。安装器会在需要时自动执行 `brew install dnsmasq`，但不会自动安装 Homebrew。
 
 当前版本在 Apple Silicon、macOS 26.3+ 和 ZoogVPN OpenVPN 连接上验证通过。Intel Homebrew 路径也受安装器支持。

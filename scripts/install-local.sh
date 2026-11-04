@@ -7,7 +7,7 @@ unset IFS CDPATH ENV BASH_ENV ZDOTDIR DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DY
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 export LC_ALL=C
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly SOURCE_DIR="${1:A}"
 readonly DNSMASQ="$2"
 readonly ROUTE_LABEL="com.local.zoog-cn-bypass"
@@ -28,6 +28,8 @@ required_files=(
   bin/zoog-cn-bypass
   src/daemon.sh
   config/dnsmasq.conf
+  config/upstream-servers.conf
+  config/corp-dns.conf
   launchd/com.local.zoog-cn-bypass.plist
   launchd/com.local.zoog-cn-dns.plist
   data/cn-ipv4.txt
@@ -80,6 +82,24 @@ validate_data_files() {
     print -u 2 -- "Security check failed: invalid or unsafe IPv6 prefix in data/cn-ipv6.txt"
     exit 65
   fi
+
+  if ! /usr/bin/awk '
+    /^[[:space:]]*$/ || /^#/ { next }
+    /^server=[0-9]{1,3}(\.[0-9]{1,3}){3}$/ { next }
+    { exit 1 }
+  ' "$SOURCE_DIR/config/upstream-servers.conf"; then
+    print -u 2 -- "Invalid line in config/upstream-servers.conf (expected: server=<ipv4>)"
+    exit 65
+  fi
+
+  if ! /usr/bin/awk '
+    /^[[:space:]]*$/ || /^#/ { next }
+    /^[A-Za-z0-9][A-Za-z0-9-]*(\.[A-Za-z0-9][A-Za-z0-9-]*)+[ \t]+[0-9]{1,3}(\.[0-9]{1,3}){3}[ \t]*$/ { next }
+    { exit 1 }
+  ' "$SOURCE_DIR/config/corp-dns.conf"; then
+    print -u 2 -- "Invalid line in config/corp-dns.conf (expected: <domain> <dns-server-ipv4>)"
+    exit 65
+  fi
 }
 
 validate_data_files
@@ -115,7 +135,7 @@ fi
 /usr/bin/install -d -o root -g wheel -m 0755 "$RUN_DIR"
 /usr/bin/install -d -m 0755 /usr/local/bin
 
-for item in daemon.sh zoog-cn-bypass cn-ipv4.txt cn-ipv6.txt dnsmasq.conf accelerated-domains.china.conf apple.china.conf dnsmasq VERSION; do
+for item in daemon.sh zoog-cn-bypass cn-ipv4.txt cn-ipv6.txt dnsmasq.conf upstream-servers.conf corp-dns.conf accelerated-domains.china.conf apple.china.conf dnsmasq VERSION; do
   /bin/unlink "$TARGET_DIR/$item" 2>/dev/null || true
 done
 
@@ -124,6 +144,8 @@ done
 /usr/bin/install -o root -g wheel -m 0644 "$SOURCE_DIR/data/cn-ipv4.txt" "$TARGET_DIR/cn-ipv4.txt"
 /usr/bin/install -o root -g wheel -m 0644 "$SOURCE_DIR/data/cn-ipv6.txt" "$TARGET_DIR/cn-ipv6.txt"
 /usr/bin/install -o root -g wheel -m 0644 "$SOURCE_DIR/config/dnsmasq.conf" "$TARGET_DIR/dnsmasq.conf"
+/usr/bin/install -o root -g wheel -m 0644 "$SOURCE_DIR/config/upstream-servers.conf" "$TARGET_DIR/upstream-servers.conf"
+/usr/bin/install -o root -g wheel -m 0644 "$SOURCE_DIR/config/corp-dns.conf" "$TARGET_DIR/corp-dns.conf"
 /usr/bin/install -o root -g wheel -m 0644 "$SOURCE_DIR/data/accelerated-domains.china.conf" "$TARGET_DIR/accelerated-domains.china.conf"
 /usr/bin/install -o root -g wheel -m 0644 "$SOURCE_DIR/data/apple.china.conf" "$TARGET_DIR/apple.china.conf"
 
