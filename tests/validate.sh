@@ -89,8 +89,11 @@ done
 /usr/bin/grep -q 'clear_corp_dns' "$ROOT_DIR/src/daemon.sh"
 /usr/bin/grep -q 'clash_tun_interface' "$ROOT_DIR/src/daemon.sh"
 /usr/bin/grep -q 'ensure_zoog_override_routes' "$ROOT_DIR/src/daemon.sh"
-/usr/bin/grep -q 'ensure_proxy_suppression' "$ROOT_DIR/src/daemon.sh"
-/usr/bin/grep -q 'restore_suppressed_proxies' "$ROOT_DIR/src/daemon.sh"
+/usr/bin/grep -q 'ensure_core_network_health' "$ROOT_DIR/src/daemon.sh"
+/usr/bin/grep -q 'ensure_physical_gateway_health' "$ROOT_DIR/src/daemon.sh"
+/usr/bin/grep -q 'ensure_univpn_gateway_routes' "$ROOT_DIR/src/daemon.sh"
+/usr/bin/grep -q 'clean_dead_local_proxies' "$ROOT_DIR/src/daemon.sh"
+/usr/bin/grep -q 'clean_dead_service_dns' "$ROOT_DIR/src/daemon.sh"
 
 if /usr/bin/grep -q '=~.*\\\.' "$ROOT_DIR/src/daemon.sh"; then
   print -u 2 -- "Use [.] instead of \\. inside zsh =~ regexes in src/daemon.sh"
@@ -122,6 +125,9 @@ fi
   valid_ipv4_cidr "223.5.5.0/24"
   ! valid_ipv4_cidr "10.0.0.0/8"
   valid_ipv6_cidr "2400:3200::/32"
+  [[ "$(normalize_netstat_cidr "192.168.1")" == "192.168.1.0/24" ]]
+  [[ "$(normalize_netstat_cidr "10.23/16")" == "10.23.0.0/16" ]]
+  [[ "$(normalize_netstat_cidr "192.168.1.1/32")" == "192.168.1.1/32" ]]
 ' _ "$ROOT_DIR/src/daemon.sh"
 
 machine_home_prefix='/''Users/'

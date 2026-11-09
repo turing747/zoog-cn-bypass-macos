@@ -20,7 +20,7 @@ readonly STATE_FILE="$RUN_DIR/state"
 readonly ACTIVE_V4="$RUN_DIR/active-v4"
 readonly ACTIVE_V6="$RUN_DIR/active-v6"
 readonly ACTIVE_OVERRIDE_V4="$RUN_DIR/active-override-v4"
-readonly SUPPRESSED_PROXIES_FILE="$RUN_DIR/suppressed-proxies"
+readonly ACTIVE_PINNED_HOSTS="$RUN_DIR/active-pinned-hosts"
 readonly ERROR_FILE="$RUN_DIR/error"
 readonly UPSTREAM_SERVERS_FILE="$INSTALL_DIR/upstream-servers.conf"
 readonly CLASH_TUN_IP="198.18.0.1"
@@ -142,7 +142,7 @@ status_command() {
   local vpn_status zoog_iface="" clash_iface="" clash_status active_tunnel
   local route_service dns_service split_status routing_status upstream_summary
   local cn_interface foreign_interface domestic_ip foreign_ip domestic_route foreign_route
-  local corp_dns corp_line override_count suppressed_count
+  local corp_dns corp_line override_count pinned_count
 
   vpn_status="$(zoog_status)"
   [[ -n "$vpn_status" ]] || vpn_status="Unavailable"
@@ -197,7 +197,7 @@ status_command() {
 
   upstream_summary="$(upstream_dns_summary)"
   override_count="$(line_count "$ACTIVE_OVERRIDE_V4")"
-  suppressed_count="$(line_count "$SUPPRESSED_PROXIES_FILE")"
+  pinned_count="$(line_count "$ACTIVE_PINNED_HOSTS")"
 
   print -- "ZoogVPN: $vpn_status"
   print -- "Clash Pro TUN: $clash_status"
@@ -212,10 +212,8 @@ status_command() {
   if (( override_count > 0 )); then
     print -- "Priority override routes: $override_count"
   fi
-  if (( suppressed_count > 0 )); then
-    print -- "Clash proxy suppression: active ($suppressed_count proxy setting suppressed)"
-  else
-    print -- "Clash proxy suppression: standby (no conflicting Clash system proxy)"
+  if (( pinned_count > 0 )); then
+    print -- "Pinned corporate gateways: $pinned_count"
   fi
 
   corp_dns="$(corp_dns_status)"

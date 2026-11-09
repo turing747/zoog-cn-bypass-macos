@@ -23,6 +23,8 @@ readonly ACTIVE_V4="$RUN_DIR/active-v4"
 readonly ACTIVE_V6="$RUN_DIR/active-v6"
 readonly ACTIVE_OVERRIDE_V4="$RUN_DIR/active-override-v4"
 readonly OVERRIDE_STATE_FILE="$RUN_DIR/override-state"
+readonly ACTIVE_PINNED_HOSTS="$RUN_DIR/active-pinned-hosts"
+readonly SCOPED_DEFAULT_FILE="$RUN_DIR/scoped-default"
 readonly SUPPRESSED_PROXIES_FILE="$RUN_DIR/suppressed-proxies"
 readonly ERROR_FILE="$RUN_DIR/error"
 readonly LOCK_FILE="$RUN_DIR/lock"
@@ -304,11 +306,30 @@ physical_ipv4_route() {
 # Ensures the physical interface retains at least an interface-scoped default
 # route (UGScI) so outbound sockets bound to en0 (ClashX Pro / NetworkExtension)
 # never fail with ENETUNREACH if a full-tunnel corporate VPN removes default.
+remove_physical_scoped_default() {
+  local old_entry old_iface old_gw
+
+  if [[ ! -L "$SCOPED_DEFAULT_FILE" && -r "$SCOPED_DEFAULT_FILE" ]]; then
+    old_entry="$(<"$SCOPED_DEFAULT_FILE")"
+    old_iface="${old_entry%%|*}"
+    old_gw="${old_entry##*|}"
+    if valid_interface "$old_iface" && valid_ipv4_gateway "$old_gw"; then
+      /sbin/route -n delete -ifscope "$old_iface" default "$old_gw" >/dev/null 2>&1 || true
+    fi
+  fi
+  /bin/unlink "$SCOPED_DEFAULT_FILE" 2>/dev/null || true
+}
+
 ensure_physical_scoped_default() {
   local gateway="$1"
   local interface="$2"
+  local desired="$interface|$gateway"
 
   valid_ipv4_gateway "$gateway" && valid_interface "$interface" || return 1
+
+  if [[ ! -L "$SCOPED_DEFAULT_FILE" && -r "$SCOPED_DEFAULT_FILE" && "$(<"$SCOPED_DEFAULT_FILE")" != "$desired" ]]; then
+    remove_physical_scoped_default
+  fi
 
   if /usr/sbin/netstat -rn -f inet | /usr/bin/awk -v target="$interface" '
     $1 == "default" && $NF == target { found = 1; exit }
@@ -318,6 +339,8 @@ ensure_physical_scoped_default() {
   fi
 
   if /sbin/route -n add -ifscope "$interface" default "$gateway" >/dev/null 2>&1; then
+    print -r -- "$desired" >| "$SCOPED_DEFAULT_FILE"
+    /bin/chmod 0644 "$SCOPED_DEFAULT_FILE"
     log_message "Restored interface-scoped default route on $interface via $gateway"
   fi
 }
@@ -337,6 +360,191 @@ route_interface_v4() {
 
 route_interface_v6() {
   /sbin/route -n get -inet6 "$1" 2>/dev/null | /usr/bin/awk '/interface:/ { print $2; exit }'
+}
+
+# --- Core network & UniVPN self-healing ------------------------------------
+# Protects macOS from UniVPN (UniVPNCS) route-monitor and crash bugs:
+# 1. Restores 127.0.0.1 / 127.0.0.0/8 on lo0 if UniVPN's Restore Route
+#    double-free deletes loopback routes.
+# 2. Removes orphaned routes pointing to dead UniVPN virtual gateways
+#    (192.168.200.*) when no active utun owns that address.
+# 3. Ensures the physical router (e.g. 192.168.1.1) is always reachable on
+#    the physical interface (e.g. en0) and never hijacked into a virtual tunnel.
+# 4. Pins configured UniVPN server gateways (/32) to the physical router so
+#    UniVPN's PF_ROUTE monitor never sees its own server routed via utun.
+
+normalize_netstat_cidr() {
+  local raw="$1"
+  local ip_part="${raw%/*}"
+  local prefix=""
+  local -a octets
+
+  if [[ "$raw" == */* ]]; then
+    prefix="${raw#*/}"
+  fi
+
+  octets=(${(s:.:)ip_part})
+  if [[ -z "$prefix" ]]; then
+    case "${#octets}" in
+      1) prefix=8 ;;
+      2) prefix=16 ;;
+      3) prefix=24 ;;
+      *) prefix=32 ;;
+    esac
+  fi
+  while (( ${#octets} < 4 )); do
+    octets+=("0")
+  done
+
+  print -r -- "${(j:.:)octets}/$prefix"
+}
+
+ensure_core_network_health() {
+  local lo_iface dead_gw dest net_target ip
+  local -A live_utun_ips
+  local -a dead_gateways
+
+  lo_iface="$(route_interface_v4 127.0.0.1)"
+  if [[ "$lo_iface" != "lo0" ]]; then
+    /sbin/ifconfig lo0 inet 127.0.0.1 netmask 255.0.0.0 up >/dev/null 2>&1 || true
+    /sbin/route -n delete -host 127.0.0.1 >/dev/null 2>&1 || true
+    /sbin/route -n add -host 127.0.0.1 127.0.0.1 >/dev/null 2>&1 || true
+    /sbin/route -n add -net 127.0.0.0 -netmask 255.0.0.0 127.0.0.1 >/dev/null 2>&1 || true
+    log_message "Self-healed missing loopback (127.0.0.1 / lo0) routes"
+  fi
+
+  for ip in $(/sbin/ifconfig 2>/dev/null | /usr/bin/awk '
+    /^[a-z0-9]+:/ {
+      current = $1
+      sub(/:$/, "", current)
+    }
+    current ~ /^utun[0-9]+$/ && $1 == "inet" {
+      print $2
+    }
+  '); do
+    live_utun_ips[$ip]=1
+  done
+
+  dead_gateways=(${(@f)"$(/usr/sbin/netstat -rn -f inet | /usr/bin/awk '
+    $2 ~ /^192\.168\.200\.[0-9]+$/ { seen[$2] = 1 }
+    END { for (gw in seen) print gw }
+  ')"})
+
+  for dead_gw in "${dead_gateways[@]}"; do
+    [[ -n "$dead_gw" ]] || continue
+    (( ${+live_utun_ips[$dead_gw]} )) && continue
+
+    while IFS= read -r dest; do
+      [[ -n "$dest" ]] || continue
+      if [[ "$dest" == "default" ]]; then
+        /sbin/route -n delete default "$dead_gw" >/dev/null 2>&1 || true
+      elif [[ "$dest" == */* ]]; then
+        net_target="$(normalize_netstat_cidr "$dest")"
+        /sbin/route -n delete -net "$net_target" "$dead_gw" >/dev/null 2>&1 || \
+          /sbin/route -n delete -net "$dest" "$dead_gw" >/dev/null 2>&1 || true
+      elif [[ "$dest" == *.*.*.* ]]; then
+        /sbin/route -n delete -host "$dest" "$dead_gw" >/dev/null 2>&1 || \
+          /sbin/route -n delete -net "$dest/32" "$dead_gw" >/dev/null 2>&1 || \
+          /sbin/route -n delete -net "$dest" -netmask 255.255.255.255 "$dead_gw" >/dev/null 2>&1 || true
+      else
+        net_target="$(normalize_netstat_cidr "$dest")"
+        /sbin/route -n delete -net "$net_target" "$dead_gw" >/dev/null 2>&1 || true
+      fi
+    done < <(/usr/sbin/netstat -rn -f inet | /usr/bin/awk -v gw="$dead_gw" '$2 == gw { print $1 }')
+    log_message "Removed orphaned corporate VPN routes via dead gateway $dead_gw"
+  done
+}
+
+ensure_physical_gateway_health() {
+  local gateway="$1"
+  local interface="$2"
+  local gw_iface
+
+  valid_ipv4_gateway "$gateway" && valid_interface "$interface" || return 1
+
+  gw_iface="$(route_interface_v4 "$gateway")"
+  if [[ "$gw_iface" != "$interface" ]]; then
+    /sbin/route -n delete -host "$gateway" >/dev/null 2>&1 || true
+    /sbin/route -n delete -net "$gateway/32" >/dev/null 2>&1 || true
+    /sbin/route -n delete -net "$gateway" -netmask 255.255.255.255 >/dev/null 2>&1 || true
+    /sbin/route -n add -net "$gateway" -interface "$interface" -netmask 255.255.255.255 -cloning >/dev/null 2>&1 || \
+      /sbin/route -n add -host "$gateway" -interface "$interface" >/dev/null 2>&1 || true
+    log_message "Self-healed physical gateway route ($gateway on $interface, was ${gw_iface:-missing})"
+  fi
+
+  if [[ -z "$(route_interface_v4 1.1.1.1)" ]]; then
+    /sbin/route -n add default "$gateway" >/dev/null 2>&1 || true
+    log_message "Self-healed missing default route via $gateway ($interface)"
+  fi
+}
+
+discover_univpn_gateways() {
+  local users_root="/""Users"
+  local ini_file ip
+  local -A seen
+
+  for ini_file in "$users_root"/*/.UniVPN/config/*.ini(N); do
+    [[ -f "$ini_file" && ! -L "$ini_file" ]] || continue
+    while IFS= read -r ip; do
+      if valid_ipv4_gateway "$ip" && valid_ipv4_cidr "$ip/32"; then
+        if (( ! ${+seen[$ip]} )); then
+          seen[$ip]=1
+          print -r -- "$ip"
+        fi
+      fi
+    done < <(/usr/bin/awk -F= '
+      $1 ~ /^[[:space:]]*GatewayAddress[[:space:]]*$/ {
+        gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", $2)
+        if ($2 != "") print $2
+      }
+    ' "$ini_file" 2>/dev/null)
+  done
+}
+
+remove_univpn_gateway_routes() {
+  local gw_ip
+
+  if [[ ! -L "$ACTIVE_PINNED_HOSTS" && -r "$ACTIVE_PINNED_HOSTS" ]]; then
+    while IFS= read -r gw_ip; do
+      valid_ipv4_gateway "$gw_ip" || continue
+      /sbin/route -n delete -host "$gw_ip" >/dev/null 2>&1 || true
+    done < "$ACTIVE_PINNED_HOSTS"
+  fi
+  /bin/unlink "$ACTIVE_PINNED_HOSTS" 2>/dev/null || true
+}
+
+ensure_univpn_gateway_routes() {
+  local gateway="$1"
+  local interface="$2"
+  local gw_ip current_iface
+
+  valid_ipv4_gateway "$gateway" && valid_interface "$interface" || return 1
+
+  if [[ -L "$ACTIVE_PINNED_HOSTS" ]]; then
+    /bin/unlink "$ACTIVE_PINNED_HOSTS" 2>/dev/null || return 1
+  fi
+  if [[ ! -f "$ACTIVE_PINNED_HOSTS" ]]; then
+    : >| "$ACTIVE_PINNED_HOSTS"
+    /bin/chmod 0644 "$ACTIVE_PINNED_HOSTS"
+  fi
+
+  for gw_ip in $(discover_univpn_gateways); do
+    current_iface="$(route_interface_v4 "$gw_ip")"
+    if [[ "$current_iface" == "$interface" ]] && /usr/bin/grep -qxF "$gw_ip" "$ACTIVE_PINNED_HOSTS" 2>/dev/null; then
+      continue
+    fi
+    if [[ "$current_iface" != "$interface" ]]; then
+      /sbin/route -n delete -host "$gw_ip" >/dev/null 2>&1 || true
+      /sbin/route -n delete -net "$gw_ip/32" >/dev/null 2>&1 || true
+    fi
+    if /sbin/route -n add -host "$gw_ip" "$gateway" >/dev/null 2>&1 || \
+       /sbin/route -n change -host "$gw_ip" "$gateway" >/dev/null 2>&1; then
+      if ! /usr/bin/grep -qxF "$gw_ip" "$ACTIVE_PINNED_HOSTS" 2>/dev/null; then
+        print -r -- "$gw_ip" >> "$ACTIVE_PINNED_HOSTS"
+      fi
+      log_message "Pinned corporate VPN gateway $gw_ip/32 to $gateway ($interface)"
+    fi
+  done
 }
 
 # --- Tunnel priority override routes (ZoogVPN over Clash, or Clash over UniVPN def1) ---
@@ -414,12 +622,11 @@ ensure_zoog_override_routes() {
   return 0
 }
 
-# --- Clash System Proxy suppression ----------------------------------------
-# When Clash System Proxy (127.0.0.1:7890/7891) is enabled, browsers send all
-# hostnames directly to Clash's HTTP/SOCKS port, bypassing kernel routes (both
-# ZoogVPN and UniVPN) and corporate split-horizon DNS. While any TUN split is
-# active we disable only Clash's local proxy ports (leaving debugging proxies
-# such as Charles/Proxyman untouched) and restore them on disconnect/disable.
+# --- Dead local proxy & dead tunnel DNS safety cleaners --------------------
+# Never fight with ClashX Pro while it is running. Instead, if macOS System
+# Proxy is left pointing to 127.0.0.1:7890/7891 when no process is listening
+# on that port (e.g. after Clash exits or crashes), automatically turn off the
+# dead proxy so HTTP/HTTPS/SOCKS traffic is not blackholed.
 
 active_local_proxy_ports() {
   /usr/sbin/scutil --proxy 2>/dev/null | /usr/bin/awk '
@@ -445,42 +652,17 @@ active_local_proxy_ports() {
   '
 }
 
-is_clash_proxy_port() {
+is_local_port_listening() {
   local port="$1"
 
   [[ "$port" == <-> ]] && (( port >= 1 && port <= 65535 )) || return 1
-  if (( port == 7890 || port == 7891 )); then
-    return 0
-  fi
-
-  /usr/sbin/lsof -Pan -iTCP:"$port" -sTCP:LISTEN -F c 2>/dev/null | /usr/bin/awk '
-    /^c([Cc]lash|[Mm]ihomo|[Vv]erge)/ { found = 1; exit }
-    END { exit(found ? 0 : 1) }
-  '
+  /usr/sbin/lsof -Pan -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
 }
 
-record_suppressed_proxy() {
-  local entry="$1"
-  local existing_line
-
-  if [[ -L "$SUPPRESSED_PROXIES_FILE" ]]; then
-    /bin/unlink "$SUPPRESSED_PROXIES_FILE" 2>/dev/null || return 1
-  fi
-  if [[ -r "$SUPPRESSED_PROXIES_FILE" ]]; then
-    while IFS= read -r existing_line; do
-      [[ "$existing_line" == "$entry" ]] && return 0
-    done < "$SUPPRESSED_PROXIES_FILE"
-  else
-    : >| "$SUPPRESSED_PROXIES_FILE"
-    /usr/sbin/chown root:wheel "$SUPPRESSED_PROXIES_FILE"
-    /bin/chmod 0644 "$SUPPRESSED_PROXIES_FILE"
-  fi
-  print -r -- "$entry" >> "$SUPPRESSED_PROXIES_FILE"
-}
-
-suppress_service_proxy_kind() {
+clear_dead_service_proxy_kind() {
   local service="$1"
   local kind="$2"
+  local dead_port="$3"
   local get_flag set_flag info enabled server port
 
   case "$kind" in
@@ -508,83 +690,129 @@ suppress_service_proxy_kind() {
   server="$(print -r -- "$info" | /usr/bin/awk -F': ' '$1 == "Server" { print $2; exit }')"
   port="$(print -r -- "$info" | /usr/bin/awk -F': ' '$1 == "Port" { print $2; exit }')"
   [[ "$server" == "127.0.0.1" || "$server" == "localhost" ]] || return 0
-  is_clash_proxy_port "$port" || return 0
+  [[ "$port" == "$dead_port" ]] || return 0
 
   if /usr/sbin/networksetup "$set_flag" "$service" off >/dev/null 2>&1; then
-    record_suppressed_proxy "$service|$kind|$server|$port"
-    log_message "Suppressed Clash $kind system proxy ($server:$port) on $service"
+    log_message "Cleared dead local $kind system proxy ($server:$port, no listener) on $service"
   fi
 }
 
-ensure_proxy_suppression() {
-  local -a candidate_ports clash_ports
+clean_dead_local_proxies() {
+  local -a candidate_ports dead_ports
   local port service line_num=0
+
+  if [[ -e "$SUPPRESSED_PROXIES_FILE" || -L "$SUPPRESSED_PROXIES_FILE" ]]; then
+    /bin/unlink "$SUPPRESSED_PROXIES_FILE" 2>/dev/null || true
+  fi
 
   candidate_ports=(${(@f)"$(active_local_proxy_ports)"})
   (( ${#candidate_ports} > 0 )) || return 0
 
   for port in "${candidate_ports[@]}"; do
-    [[ -n "$port" ]] && is_clash_proxy_port "$port" && clash_ports+=("$port")
+    [[ "$port" == "7890" || "$port" == "7891" ]] || continue
+    if ! is_local_port_listening "$port"; then
+      dead_ports+=("$port")
+    fi
   done
-  (( ${#clash_ports} > 0 )) || return 0
+  (( ${#dead_ports} > 0 )) || return 0
 
   while IFS= read -r service; do
     (( ++line_num == 1 )) && continue
     [[ -z "$service" || "$service" == \** ]] && continue
     valid_service_name "$service" || continue
-    suppress_service_proxy_kind "$service" web
-    suppress_service_proxy_kind "$service" secureweb
-    suppress_service_proxy_kind "$service" socks
+    for port in "${dead_ports[@]}"; do
+      clear_dead_service_proxy_kind "$service" web "$port"
+      clear_dead_service_proxy_kind "$service" secureweb "$port"
+      clear_dead_service_proxy_kind "$service" socks "$port"
+    done
   done < <(/usr/sbin/networksetup -listallnetworkservices 2>/dev/null)
 }
 
-restore_suppressed_proxies() {
-  local service kind server port get_flag set_flag info cur_enabled cur_server cur_port restored=0
+is_dead_tunnel_dns_server() {
+  local server="$1"
+  local zoog_interface="$2"
+  local clash_interface="$3"
+  local physical_interface="$4"
+  local physical_gateway="$5"
+  local default_interface="$6"
+  local route_iface
 
-  if ! verify_safe_file "$SUPPRESSED_PROXIES_FILE"; then
-    /bin/unlink "$SUPPRESSED_PROXIES_FILE" 2>/dev/null || true
-    return 0
+  valid_ipv4_gateway "$server" || return 1
+  [[ "$server" != "$physical_gateway" ]] || return 1
+
+  # Clash Fake-IP DNS (198.18.0.2) is dead whenever Clash TUN is not active.
+  if [[ "$server" == "$CLASH_TUN_DNS" || "$server" == 198.18.* ]]; then
+    [[ -z "$clash_interface" ]]
+    return $?
   fi
 
-  while IFS='|' read -r service kind server port; do
-    valid_service_name "$service" || continue
-    [[ "$server" == "127.0.0.1" || "$server" == "localhost" ]] || continue
-    [[ "$port" == <-> ]] && (( port >= 1 && port <= 65535 )) || continue
-
-    case "$kind" in
-      web)
-        get_flag="-getwebproxy"
-        set_flag="-setwebproxystate"
-        ;;
-      secureweb)
-        get_flag="-getsecurewebproxy"
-        set_flag="-setsecurewebproxystate"
-        ;;
-      socks)
-        get_flag="-getsocksfirewallproxy"
-        set_flag="-setsocksfirewallproxystate"
-        ;;
-      *)
-        continue
-        ;;
-    esac
-
-    info="$(/usr/sbin/networksetup "$get_flag" "$service" 2>/dev/null)" || continue
-    cur_enabled="$(print -r -- "$info" | /usr/bin/awk -F': ' '$1 == "Enabled" { print $2; exit }')"
-    cur_server="$(print -r -- "$info" | /usr/bin/awk -F': ' '$1 == "Server" { print $2; exit }')"
-    cur_port="$(print -r -- "$info" | /usr/bin/awk -F': ' '$1 == "Port" { print $2; exit }')"
-
-    if [[ "$cur_enabled" == "No" && "$cur_server" == "$server" && "$cur_port" == "$port" ]]; then
-      if /usr/sbin/networksetup "$set_flag" "$service" on >/dev/null 2>&1; then
-        restored=1
+  # Corporate VPN DNS servers (e.g. 10.23.101.11 from corp-dns.conf or 192.168.200.*)
+  # are dead when they no longer route through a dedicated corporate utun interface.
+  if [[ "$server" == 10.* || "$server" == 192.168.200.* || "$server" == 172.(1[6-9]|2[0-9]|3[0-1]).* ]]; then
+    route_iface="$(route_interface_v4 "$server")"
+    if [[ -z "$route_iface" || "$route_iface" != utun* || "$route_iface" == "$default_interface" || "$route_iface" == "$physical_interface" || "$route_iface" == "$zoog_interface" || "$route_iface" == "$clash_interface" ]]; then
+      if [[ "$server" == 192.168.200.* ]] || /usr/bin/grep -qE "^[[:space:]]*[^#[:space:]]+[[:space:]]+${server//./[.]}([[:space:]]|$)" "$CORP_DNS_CONF" 2>/dev/null; then
+        return 0
+      fi
+      if ! /usr/bin/dig +time=1 +tries=1 @"$server" . SOA >/dev/null 2>&1; then
+        return 0
       fi
     fi
-  done < "$SUPPRESSED_PROXIES_FILE"
-
-  /bin/unlink "$SUPPRESSED_PROXIES_FILE" 2>/dev/null || true
-  if (( restored )); then
-    log_message "Restored previously suppressed Clash system proxy settings"
   fi
+
+  return 1
+}
+
+clean_dead_service_dns() {
+  local zoog_interface="${1:-}"
+  local clash_interface="${2:-}"
+  local physical_interface="${3:-}"
+  local physical_gateway="${4:-}"
+  local setup_keys default_interface service dns_out line_num=0
+  local -a kept_servers dead_servers
+  local srv
+
+  setup_keys="$(/usr/bin/printf '%s\n' 'list Setup:/Network/Service/.*/DNS' quit \
+    | /usr/sbin/scutil 2>/dev/null \
+    | /usr/bin/awk '$NF ~ /^Setup:\/Network\/Service\/.*\/DNS$/ { print $NF }')"
+  [[ -n "$setup_keys" ]] || return 0
+
+  default_interface="$(route_interface_v4 1.1.1.1)"
+
+  while IFS= read -r service; do
+    (( ++line_num == 1 )) && continue
+    [[ -z "$service" || "$service" == \** ]] && continue
+    valid_service_name "$service" || continue
+
+    dns_out="$(/usr/sbin/networksetup -getdnsservers "$service" 2>/dev/null)" || continue
+    [[ "$dns_out" == *"There aren't any DNS Servers"* ]] && continue
+
+    kept_servers=()
+    dead_servers=()
+    for srv in "${(@f)dns_out}"; do
+      srv="${srv//[[:space:]]/}"
+      [[ -n "$srv" ]] || continue
+      if is_dead_tunnel_dns_server "$srv" "$zoog_interface" "$clash_interface" "$physical_interface" "$physical_gateway" "$default_interface"; then
+        dead_servers+=("$srv")
+      else
+        kept_servers+=("$srv")
+      fi
+    done
+
+    (( ${#dead_servers} > 0 )) || continue
+
+    if (( ${#kept_servers} == 0 )); then
+      if /usr/sbin/networksetup -setdnsservers "$service" Empty >/dev/null 2>&1; then
+        flush_system_dns_cache
+        log_message "Cleared dead tunnel DNS (${dead_servers[*]}) on $service -> Empty (DHCP)"
+      fi
+    else
+      if /usr/sbin/networksetup -setdnsservers "$service" "${kept_servers[@]}" >/dev/null 2>&1; then
+        flush_system_dns_cache
+        log_message "Removed dead tunnel DNS (${dead_servers[*]}) on $service, kept (${kept_servers[*]})"
+      fi
+    fi
+  done < <(/usr/sbin/networksetup -listallnetworkservices 2>/dev/null)
 }
 
 # --- Dynamic dnsmasq upstream & macOS DNS override -------------------------
@@ -1029,8 +1257,11 @@ reconcile() {
   local active_tunnel="none" target_utun=""
   local installed_v4 installed_v6
 
-  ipv4_info="$(physical_ipv4_route)"
-  [[ -n "$ipv4_info" ]] && ipv4_interface="${ipv4_info##*|}"
+  # 1. Self-heal loopback (lo0) and purge orphaned routes via dead 192.168.200.* gateways.
+  ensure_core_network_health
+
+  # 2. Clear any dead Clash system proxy (127.0.0.1:7890/7891 with no listening process).
+  clean_dead_local_proxies
 
   if zoog_is_connected; then
     active_tunnel="zoog"
@@ -1043,28 +1274,16 @@ reconcile() {
     active_tunnel="clash"
   fi
 
-  if [[ "$active_tunnel" == "none" ]]; then
-    ensure_corp_dns "" "" "$ipv4_interface"
-    clear_dns_override
-    remove_zoog_override_routes
-    restore_suppressed_proxies
-    if [[ -e "$STATE_FILE" || -e "$ACTIVE_V4" || -e "$ACTIVE_V6" ]]; then
-      ipv6_info="$(physical_ipv6_route)"
-      expected_state="${ipv4_info%%|*}|${ipv4_info##*|}|${ipv6_info%%|*}|${ipv6_info##*|}"
-      if [[ "$(route_interface_v4 1.1.1.1)" == utun* ]] || ! routes_are_current "$expected_state" "${ipv4_info##*|}" "${ipv6_info##*|}"; then
-        remove_recorded_routes
-        log_message "China-direct routes removed while ZoogVPN and Clash Pro TUN are disconnected"
-      fi
-    fi
-    clear_error
-    return 0
-  fi
-
+  ipv4_info="$(physical_ipv4_route)"
   if [[ -z "$ipv4_info" ]]; then
     clear_dns_override
     remove_zoog_override_routes
-    log_once "Active tunnel ($active_tunnel) connected, but no physical IPv4 gateway was found"
-    return 1
+    clean_dead_service_dns "$zoog_iface" "$clash_iface" "" ""
+    if [[ "$active_tunnel" != "none" ]]; then
+      log_once "Active tunnel ($active_tunnel) connected, but no physical IPv4 gateway was found"
+      return 1
+    fi
+    return 0
   fi
   ipv4_gateway="${ipv4_info%%|*}"
   ipv4_interface="${ipv4_info##*|}"
@@ -1076,49 +1295,24 @@ reconcile() {
     return 1
   fi
 
+  # 3. Heal physical gateway reachability on the physical interface and retain
+  # an interface-scoped default route.
+  ensure_physical_gateway_health "$ipv4_gateway" "$ipv4_interface"
   ensure_physical_scoped_default "$ipv4_gateway" "$ipv4_interface"
 
-  # Suppress Clash System Proxy (127.0.0.1:7890/7891) so browser traffic uses
-  # kernel routing (UniVPN intranet, China-direct en0, ZoogVPN / Clash TUN).
-  ensure_proxy_suppression
+  # 4. Pin configured corporate VPN (UniVPN) server gateways (/32) to the
+  # physical gateway so UniVPN's PF_ROUTE monitor never sees its own server
+  # routed through utun.
+  ensure_univpn_gateway_routes "$ipv4_gateway" "$ipv4_interface"
 
-  if [[ "$active_tunnel" == "zoog" ]]; then
-    if [[ -z "$zoog_iface" ]]; then
-      clear_dns_override
-      remove_zoog_override_routes
-      log_once "ZoogVPN is connected, but its utun interface could not be determined"
-      return 1
-    fi
-    target_utun="$zoog_iface"
-    if [[ -n "$clash_iface" || "$(route_interface_v4 1.1.1.1)" != "$zoog_iface" ]]; then
-      if ! ensure_zoog_override_routes "$zoog_iface" "$zoog_gw"; then
-        clear_dns_override
-        log_once "Failed to install ZoogVPN priority routes"
-        return 1
-      fi
-    else
-      remove_zoog_override_routes
-    fi
-  else
-    target_utun="$clash_iface"
-    if [[ -r "$OVERRIDE_STATE_FILE" ]]; then
-      if [[ "$(<"$OVERRIDE_STATE_FILE")" != "$clash_iface|$CLASH_TUN_IP" ]] || ! has_competing_half_default "$clash_iface"; then
-        remove_zoog_override_routes
-      fi
-    fi
-    if [[ "$(route_interface_v4 1.1.1.1)" != "$clash_iface" || "$(route_interface_v4 "$CLASH_TUN_DNS")" != "$clash_iface" ]]; then
-      if ! ensure_zoog_override_routes "$clash_iface" "$CLASH_TUN_IP"; then
-        clear_dns_override
-        log_once "Failed to restore Clash Pro TUN priority over competing default route"
-        return 1
-      fi
-    fi
-  fi
+  # 5. Clean any dead tunnel DNS servers (e.g. 10.23.101.11 or 198.18.0.2)
+  # stranded in networksetup after an ungraceful VPN/Clash exit.
+  clean_dead_service_dns "$zoog_iface" "$clash_iface" "$ipv4_interface" "$ipv4_gateway"
 
-  # Independent of ZoogVPN/Clash: corporate VPN DNS works whenever reachable
-  # via its own dedicated interface (e.g. UniVPN).
-  ensure_corp_dns "$zoog_iface" "$clash_iface" "$ipv4_interface"
-
+  # 6. Maintain China-direct routes persistently while enabled, keyed by
+  # physical gateway/interface state. Keeping these routes steady eliminates
+  # the 5,494-route PF_ROUTE storm and 5-second window when ZoogVPN or Clash
+  # connects, disconnects, or briefly flaps.
   ipv6_info="$(physical_ipv6_route)"
   if [[ -n "$ipv6_info" ]]; then
     ipv6_gateway="${ipv6_info%%|*}"
@@ -1137,12 +1331,6 @@ reconcile() {
       add_ipv6_routes "$ipv6_gateway"
     fi
 
-    if ! zoog_is_connected && [[ -z "$(clash_tun_interface 2>/dev/null || true)" ]]; then
-      remove_zoog_override_routes
-      remove_recorded_routes
-      return 0
-    fi
-
     if ! routes_are_current_without_state "$ipv4_interface" "$ipv6_interface"; then
       remove_recorded_routes
       log_once "China-direct route verification failed; all added routes were rolled back"
@@ -1158,6 +1346,54 @@ reconcile() {
     log_message "China-direct routing active on $ipv4_interface: $installed_v4 IPv4 and $installed_v6 IPv6 routes"
   fi
 
+  # 7. Independent of ZoogVPN/Clash: corporate VPN DNS works whenever reachable
+  # via its own dedicated interface (e.g. UniVPN).
+  ensure_corp_dns "$zoog_iface" "$clash_iface" "$ipv4_interface"
+
+  # 8. When neither ZoogVPN nor Clash TUN is active, keep China routes in
+  # standby and ensure foreign tunnel overrides are removed.
+  if [[ "$active_tunnel" == "none" ]]; then
+    clear_dns_override
+    remove_zoog_override_routes
+    clear_error
+    return 0
+  fi
+
+  # 9. Only AFTER China routes and gateway protections are verified, install
+  # tunnel priority override routes if and only if a competing tunnel is active.
+  if [[ "$active_tunnel" == "zoog" ]]; then
+    if [[ -z "$zoog_iface" ]]; then
+      clear_dns_override
+      remove_zoog_override_routes
+      log_once "ZoogVPN is connected, but its utun interface could not be determined"
+      return 1
+    fi
+    target_utun="$zoog_iface"
+    if [[ -n "$clash_iface" ]] || has_competing_half_default "$zoog_iface"; then
+      if ! ensure_zoog_override_routes "$zoog_iface" "$zoog_gw"; then
+        clear_dns_override
+        log_once "Failed to install ZoogVPN priority routes"
+        return 1
+      fi
+    else
+      remove_zoog_override_routes
+    fi
+  else
+    target_utun="$clash_iface"
+    if [[ -r "$OVERRIDE_STATE_FILE" ]] && [[ "$(<"$OVERRIDE_STATE_FILE")" != "$clash_iface|$CLASH_TUN_IP" ]]; then
+      remove_zoog_override_routes
+    fi
+    if has_competing_half_default "$clash_iface"; then
+      if ! ensure_zoog_override_routes "$clash_iface" "$CLASH_TUN_IP"; then
+        clear_dns_override
+        log_once "Failed to restore Clash Pro TUN priority over competing default route"
+        return 1
+      fi
+    else
+      remove_zoog_override_routes
+    fi
+  fi
+
   if ! ensure_upstream_dns "$active_tunnel"; then
     clear_dns_override
     log_once "Could not configure dnsmasq upstream for $active_tunnel tunnel"
@@ -1171,19 +1407,43 @@ reconcile() {
   return 1
 }
 
+stop_daemon() {
+  local ipv4_info ipv4_gateway="" ipv4_interface="" zoog_iface="" clash_iface=""
+
+  ensure_core_network_health
+  clean_dead_local_proxies
+  clear_corp_dns
+  clear_dns_override
+  remove_zoog_override_routes
+  remove_univpn_gateway_routes
+  remove_physical_scoped_default
+  remove_recorded_routes
+
+  ipv4_info="$(physical_ipv4_route 2>/dev/null || true)"
+  if [[ -n "$ipv4_info" ]]; then
+    ipv4_gateway="${ipv4_info%%|*}"
+    ipv4_interface="${ipv4_info##*|}"
+    if valid_ipv4_gateway "$ipv4_gateway" && valid_interface "$ipv4_interface"; then
+      ensure_physical_gateway_health "$ipv4_gateway" "$ipv4_interface"
+    fi
+  fi
+  if zoog_is_connected; then
+    zoog_iface="${$(zoog_utun_info 2>/dev/null || true)%%|*}"
+  fi
+  clash_iface="$(clash_tun_interface 2>/dev/null || true)"
+  clean_dead_service_dns "$zoog_iface" "$clash_iface" "$ipv4_interface" "$ipv4_gateway"
+
+  ensure_upstream_dns "zoog" >/dev/null 2>&1 || true
+  clear_error
+}
+
 main() {
   case "${1:-reconcile}" in
     reconcile)
       reconcile
       ;;
     stop)
-      clear_corp_dns
-      clear_dns_override
-      remove_zoog_override_routes
-      remove_recorded_routes
-      restore_suppressed_proxies
-      ensure_upstream_dns "zoog" >/dev/null 2>&1 || true
-      clear_error
+      stop_daemon
       ;;
     *)
       print -u 2 -- "Usage: $0 [reconcile|stop]"
