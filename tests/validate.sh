@@ -114,6 +114,7 @@ fi
     /^case "\$\{1:-reconcile\}" in$/ { exit }
     { print }
   '\'' "$1")"
+  set -e
   valid_ipv4_gateway "192.168.1.1"
   ! valid_ipv4_gateway "bad"
   valid_ipv6_gateway "fe80::1%en0"
@@ -128,6 +129,80 @@ fi
   [[ "$(normalize_netstat_cidr "192.168.1")" == "192.168.1.0/24" ]]
   [[ "$(normalize_netstat_cidr "10.23/16")" == "10.23.0.0/16" ]]
   [[ "$(normalize_netstat_cidr "192.168.1.1/32")" == "192.168.1.1/32" ]]
+
+  host_sample=$'\''   route to: 61.157.75.133\ndestination: 61.157.75.133\n    gateway: 192.168.0.1\n  interface: en0'\''
+  net_sample=$'\''   route to: 61.157.75.133\ndestination: 61.128.0.0\n       mask: 255.192.0.0\n    gateway: 172.20.10.1\n  interface: en0'\''
+  utun_sample=$'\''   route to: 1.1.1.1\ndestination: default\n  interface: utun7'\''
+  [[ "$(print -r -- "$host_sample" | parse_route_get_v4)" == "61.157.75.133|192.168.0.1|en0" ]]
+  [[ "$(print -r -- "$net_sample" | parse_route_get_v4)" == "61.128.0.0|172.20.10.1|en0" ]]
+  [[ "$(print -r -- "$utun_sample" | parse_route_get_v4)" == "default||utun7" ]]
+
+  # Regression test: pinned UniVPN gateways update across same-interface gateway
+  # changes, missing /32 host routes, interface switches, and .ini removals.
+  tmp_pinned="$(/usr/bin/mktemp /tmp/zoog-pinned-test.XXXXXX)"
+  trap '\''/bin/unlink "$tmp_pinned" "$tmp_pinned.$$" 2>/dev/null || true'\'' EXIT
+  /bin/unlink "$tmp_pinned"
+  typeset -A mock_routes=()
+  typeset -a mock_ini=("61.157.75.133" "182.150.6.130")
+  mock_iface_for_gw() {
+    case "$1" in
+      192.168.0.1|172.20.10.1) print -r -- "en0" ;;
+      10.0.0.1) print -r -- "en5" ;;
+      *) print -r -- "en0" ;;
+    esac
+  }
+  log_message() { :; }
+  discover_univpn_gateways() { print -r -l -- "${mock_ini[@]}"; }
+  route_summary_v4() { print -r -- "${mock_routes[$1]:-61.128.0.0|172.20.10.1|en0}"; }
+  run_route_cmd() {
+    # Expect: -n <add|change|delete> (-host|-net) <ip> [gw]
+    local op="$2" kind="$3" ip="${4%/*}" gw="${5:-}"
+    case "$op" in
+      add)
+        [[ -z "${mock_routes[$ip]:-}" ]] || return 1
+        mock_routes[$ip]="$ip|$gw|$(mock_iface_for_gw "$gw")"
+        ;;
+      change)
+        [[ -n "${mock_routes[$ip]:-}" ]] || return 1
+        local existing_iface="${mock_routes[$ip]##*|}"
+        local target_iface="$(mock_iface_for_gw "$gw")"
+        [[ "$existing_iface" == "$target_iface" ]] || return 1
+        mock_routes[$ip]="$ip|$gw|$target_iface"
+        ;;
+      delete)
+        unset "mock_routes[$ip]"
+        ;;
+    esac
+  }
+
+  # 1) Initial pin on Wi-Fi 192.168.0.1 (en0)
+  ensure_univpn_gateway_routes "192.168.0.1" "en0" "$tmp_pinned"
+  [[ "${mock_routes[61.157.75.133]}" == "61.157.75.133|192.168.0.1|en0" ]]
+  [[ "${mock_routes[182.150.6.130]}" == "182.150.6.130|192.168.0.1|en0" ]]
+
+  # 2) Same interface (en0) switches to hotspot gateway 172.20.10.1
+  ensure_univpn_gateway_routes "172.20.10.1" "en0" "$tmp_pinned"
+  [[ "${mock_routes[61.157.75.133]}" == "61.157.75.133|172.20.10.1|en0" ]]
+  [[ "${mock_routes[182.150.6.130]}" == "182.150.6.130|172.20.10.1|en0" ]]
+
+  # 3) External deletion of /32 host route (falls back to subnet route on en0) is restored
+  unset "mock_routes[61.157.75.133]"
+  ensure_univpn_gateway_routes "172.20.10.1" "en0" "$tmp_pinned"
+  [[ "${mock_routes[61.157.75.133]}" == "61.157.75.133|172.20.10.1|en0" ]]
+
+  # 4) Interface switch en0 -> en5 where route change fails falls back to delete+add
+  ensure_univpn_gateway_routes "10.0.0.1" "en5" "$tmp_pinned"
+  [[ "${mock_routes[61.157.75.133]}" == "61.157.75.133|10.0.0.1|en5" ]]
+
+  # 5) Removing an IP from .ini prunes its pinned /32 route and state file
+  mock_ini=("61.157.75.133")
+  ensure_univpn_gateway_routes "10.0.0.1" "en5" "$tmp_pinned"
+  [[ -z "${mock_routes[182.150.6.130]:-}" ]]
+  [[ "$(<"$tmp_pinned")" == "61.157.75.133" ]]
+
+  remove_univpn_gateway_routes "$tmp_pinned"
+  [[ ! -e "$tmp_pinned" ]]
+  [[ -z "${mock_routes[61.157.75.133]:-}" ]]
 ' _ "$ROOT_DIR/src/daemon.sh"
 
 machine_home_prefix='/''Users/'

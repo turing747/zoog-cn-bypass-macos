@@ -130,6 +130,84 @@ route_interface() {
   /sbin/route -n get "$1" 2>/dev/null | /usr/bin/awk '/interface:/ { print $2; exit }'
 }
 
+route_summary() {
+  /sbin/route -n get "$1" 2>/dev/null | /usr/bin/awk '
+    $1 == "destination:" { dest = $2 }
+    $1 == "gateway:" { gw = $2 }
+    $1 == "interface:" { iface = $2 }
+    END { print dest "|" gw "|" iface }
+  '
+}
+
+physical_ipv4_route() {
+  local route_line key
+
+  route_line="$(/usr/sbin/netstat -rn -f inet | /usr/bin/awk '
+    $1 == "default" && $NF !~ /^utun/ && $2 ~ /^[0-9]+\./ {
+      print $2 "|" $NF
+      exit
+    }
+  ')"
+  if [[ -n "$route_line" ]]; then
+    print -r -- "$route_line"
+    return 0
+  fi
+
+  for key in $(/usr/bin/printf '%s\n' 'list State:/Network/Service/.*/IPv4' quit \
+      | /usr/sbin/scutil 2>/dev/null \
+      | /usr/bin/awk '$NF ~ /^State:\/Network\/Service\/.*\/IPv4$/ { print $NF }'); do
+    route_line="$(/usr/bin/printf '%s\n' "show $key" quit | /usr/sbin/scutil 2>/dev/null | /usr/bin/awk '
+      $1 == "InterfaceName" && $2 == ":" { iface = $3 }
+      $1 == "Router" && $2 == ":" { router = $3 }
+      END {
+        if (iface != "" && iface !~ /^(utun|lo|ipsec|ppp|gif|stf)/ && router ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+          print router "|" iface
+        }
+      }
+    ')"
+    if [[ -n "$route_line" ]]; then
+      print -r -- "$route_line"
+      return 0
+    fi
+  done
+  return 1
+}
+
+print_pinned_gateways_status() {
+  local phys_info phys_gw="" phys_iface=""
+  local gw_ip summary dest rest gw iface actual_target
+  local ipv4_pattern='^[0-9]{1,3}([.]([0-9]{1,3})){3}$'
+
+  [[ -r "$ACTIVE_PINNED_HOSTS" && ! -L "$ACTIVE_PINNED_HOSTS" ]] || return 0
+
+  phys_info="$(physical_ipv4_route 2>/dev/null || true)"
+  if [[ -n "$phys_info" ]]; then
+    phys_gw="${phys_info%%|*}"
+    phys_iface="${phys_info##*|}"
+  fi
+
+  while IFS= read -r gw_ip; do
+    gw_ip="${gw_ip%%|*}"
+    [[ "$gw_ip" =~ $ipv4_pattern ]] || continue
+    summary="$(route_summary "$gw_ip")"
+    dest="${summary%%|*}"
+    rest="${summary#*|}"
+    gw="${rest%%|*}"
+    iface="${rest#*|}"
+    actual_target="${gw:-direct} via ${iface:-none}"
+
+    if [[ -z "$phys_gw" ]]; then
+      print -r -- "  Pinned gateway — $gw_ip: -> $actual_target (standby, no physical IPv4 gateway)"
+    elif [[ "$dest" == "$gw_ip" && "$gw" == "$phys_gw" && "$iface" == "$phys_iface" ]]; then
+      print -r -- "  Pinned gateway — $gw_ip: -> $gw via $iface"
+    elif [[ "$dest" != "$gw_ip" ]]; then
+      print -r -- "  Pinned gateway — $gw_ip: -> $actual_target (WARNING: /32 host route missing, matched ${dest:-none}; expected -> $phys_gw via $phys_iface)"
+    else
+      print -r -- "  Pinned gateway — $gw_ip: -> $actual_target (WARNING: stale route, expected -> $phys_gw via $phys_iface)"
+    fi
+  done < "$ACTIVE_PINNED_HOSTS"
+}
+
 line_count() {
   if [[ -r "$1" ]]; then
     /usr/bin/wc -l < "$1" | /usr/bin/tr -d ' '
@@ -214,6 +292,7 @@ status_command() {
   fi
   if (( pinned_count > 0 )); then
     print -- "Pinned corporate gateways: $pinned_count"
+    print_pinned_gateways_status
   fi
 
   corp_dns="$(corp_dns_status)"

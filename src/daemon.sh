@@ -354,6 +354,19 @@ physical_ipv6_route() {
   '
 }
 
+parse_route_get_v4() {
+  /usr/bin/awk '
+    $1 == "destination:" { dest = $2 }
+    $1 == "gateway:" { gw = $2 }
+    $1 == "interface:" { iface = $2 }
+    END { print dest "|" gw "|" iface }
+  '
+}
+
+route_summary_v4() {
+  /sbin/route -n get "$1" 2>/dev/null | parse_route_get_v4
+}
+
 route_interface_v4() {
   /sbin/route -n get "$1" 2>/dev/null | /usr/bin/awk '/interface:/ { print $2; exit }'
 }
@@ -501,50 +514,120 @@ discover_univpn_gateways() {
   done
 }
 
+run_route_cmd() {
+  /sbin/route "$@"
+}
+
+delete_pinned_host_route() {
+  local gw_ip="$1"
+  local summary cur_rest cur_gw
+
+  valid_ipv4_gateway "$gw_ip" || return 1
+
+  summary="$(route_summary_v4 "$gw_ip")"
+  if [[ "${summary%%|*}" == "$gw_ip" ]]; then
+    cur_rest="${summary#*|}"
+    cur_gw="${cur_rest%%|*}"
+    if [[ -n "$cur_gw" ]] && valid_ipv4_gateway "$cur_gw"; then
+      run_route_cmd -n delete -host "$gw_ip" "$cur_gw" >/dev/null 2>&1 || true
+    fi
+  fi
+  run_route_cmd -n delete -host "$gw_ip" >/dev/null 2>&1 || true
+  run_route_cmd -n delete -net "$gw_ip/32" >/dev/null 2>&1 || true
+}
+
 remove_univpn_gateway_routes() {
+  local pinned_file="${1:-$ACTIVE_PINNED_HOSTS}"
   local gw_ip
 
-  if [[ ! -L "$ACTIVE_PINNED_HOSTS" && -r "$ACTIVE_PINNED_HOSTS" ]]; then
+  if [[ ! -L "$pinned_file" && -r "$pinned_file" ]]; then
     while IFS= read -r gw_ip; do
+      gw_ip="${gw_ip%%|*}"
       valid_ipv4_gateway "$gw_ip" || continue
-      /sbin/route -n delete -host "$gw_ip" >/dev/null 2>&1 || true
-    done < "$ACTIVE_PINNED_HOSTS"
+      delete_pinned_host_route "$gw_ip"
+    done < "$pinned_file"
   fi
-  /bin/unlink "$ACTIVE_PINNED_HOSTS" 2>/dev/null || true
+  /bin/unlink "$pinned_file" 2>/dev/null || true
 }
 
 ensure_univpn_gateway_routes() {
   local gateway="$1"
   local interface="$2"
-  local gw_ip current_iface
+  local pinned_file="${3:-$ACTIVE_PINNED_HOSTS}"
+  local expected summary cur_dest gw_ip old_ip
+  local temporary="$pinned_file.$$"
+  local -a desired_gateways=() active_list=()
+  local -A desired_map=()
 
   valid_ipv4_gateway "$gateway" && valid_interface "$interface" || return 1
 
-  if [[ -L "$ACTIVE_PINNED_HOSTS" ]]; then
-    /bin/unlink "$ACTIVE_PINNED_HOSTS" 2>/dev/null || return 1
-  fi
-  if [[ ! -f "$ACTIVE_PINNED_HOSTS" ]]; then
-    : >| "$ACTIVE_PINNED_HOSTS"
-    /bin/chmod 0644 "$ACTIVE_PINNED_HOSTS"
+  if [[ -L "$pinned_file" ]]; then
+    /bin/unlink "$pinned_file" 2>/dev/null || return 1
   fi
 
-  for gw_ip in $(discover_univpn_gateways); do
-    current_iface="$(route_interface_v4 "$gw_ip")"
-    if [[ "$current_iface" == "$interface" ]] && /usr/bin/grep -qxF "$gw_ip" "$ACTIVE_PINNED_HOSTS" 2>/dev/null; then
+  desired_gateways=(${(@f)"$(discover_univpn_gateways)"})
+  for gw_ip in "${desired_gateways[@]}"; do
+    [[ -n "$gw_ip" ]] || continue
+    desired_map[$gw_ip]=1
+  done
+
+  if [[ -r "$pinned_file" ]]; then
+    while IFS= read -r old_ip; do
+      old_ip="${old_ip%%|*}"
+      valid_ipv4_gateway "$old_ip" || continue
+      if (( ! ${+desired_map[$old_ip]} )); then
+        delete_pinned_host_route "$old_ip"
+        log_message "Removed obsolete pinned corporate VPN gateway $old_ip/32"
+      fi
+    done < "$pinned_file"
+  fi
+
+  for gw_ip in "${desired_gateways[@]}"; do
+    [[ -n "$gw_ip" ]] || continue
+    expected="$gw_ip|$gateway|$interface"
+    summary="$(route_summary_v4 "$gw_ip")"
+
+    if [[ "$summary" == "$expected" ]]; then
+      active_list+=("$gw_ip")
       continue
     fi
-    if [[ "$current_iface" != "$interface" ]]; then
-      /sbin/route -n delete -host "$gw_ip" >/dev/null 2>&1 || true
-      /sbin/route -n delete -net "$gw_ip/32" >/dev/null 2>&1 || true
-    fi
-    if /sbin/route -n add -host "$gw_ip" "$gateway" >/dev/null 2>&1 || \
-       /sbin/route -n change -host "$gw_ip" "$gateway" >/dev/null 2>&1; then
-      if ! /usr/bin/grep -qxF "$gw_ip" "$ACTIVE_PINNED_HOSTS" 2>/dev/null; then
-        print -r -- "$gw_ip" >> "$ACTIVE_PINNED_HOSTS"
+
+    cur_dest="${summary%%|*}"
+    if [[ "$cur_dest" == "$gw_ip" ]]; then
+      run_route_cmd -n change -host "$gw_ip" "$gateway" >/dev/null 2>&1 || true
+      if [[ "$(route_summary_v4 "$gw_ip")" != "$expected" ]]; then
+        delete_pinned_host_route "$gw_ip"
+        run_route_cmd -n add -host "$gw_ip" "$gateway" >/dev/null 2>&1 || true
       fi
+    else
+      run_route_cmd -n add -host "$gw_ip" "$gateway" >/dev/null 2>&1 || \
+        run_route_cmd -n change -host "$gw_ip" "$gateway" >/dev/null 2>&1 || true
+      if [[ "$(route_summary_v4 "$gw_ip")" != "$expected" ]]; then
+        delete_pinned_host_route "$gw_ip"
+        run_route_cmd -n add -host "$gw_ip" "$gateway" >/dev/null 2>&1 || true
+      fi
+    fi
+
+    summary="$(route_summary_v4 "$gw_ip")"
+    if [[ "$summary" == "$expected" ]]; then
+      active_list+=("$gw_ip")
       log_message "Pinned corporate VPN gateway $gw_ip/32 to $gateway ($interface)"
+    else
+      if [[ "${summary%%|*}" == "$gw_ip" ]]; then
+        active_list+=("$gw_ip")
+      fi
+      log_message "Warning: failed to pin corporate VPN gateway $gw_ip/32 to $gateway ($interface), got $summary"
     fi
   done
+
+  /bin/unlink "$temporary" 2>/dev/null || true
+  if (( ${#active_list} > 0 )); then
+    print -r -l -- "${active_list[@]}" >| "$temporary" || return 1
+    /bin/chmod 0644 "$temporary"
+    /bin/mv -f "$temporary" "$pinned_file"
+  else
+    /bin/unlink "$pinned_file" 2>/dev/null || true
+  fi
 }
 
 # --- Tunnel priority override routes (ZoogVPN over Clash, or Clash over UniVPN def1) ---
@@ -1220,19 +1303,27 @@ add_ipv6_routes() {
 
 routes_are_current() {
   local expected_state="$1"
-  local interface_v4="$2"
-  local interface_v6="$3"
+  local gateway_v4="$2"
+  local interface_v4="$3"
+  local interface_v6="$4"
 
   [[ ! -L "$STATE_FILE" && -r "$STATE_FILE" && "$(<"$STATE_FILE")" == "$expected_state" ]] || return 1
-  routes_are_current_without_state "$interface_v4" "$interface_v6"
+  routes_are_current_without_state "$gateway_v4" "$interface_v4" "$interface_v6"
 }
 
 routes_are_current_without_state() {
-  local interface_v4="$1"
-  local interface_v6="$2"
+  local gateway_v4="$1"
+  local interface_v4="$2"
+  local interface_v6="$3"
+  local probe summary rest gw iface
 
-  [[ "$(route_interface_v4 223.5.5.5)" == "$interface_v4" ]] || return 1
-  [[ "$(route_interface_v4 114.114.114.114)" == "$interface_v4" ]] || return 1
+  for probe in 223.5.5.5 114.114.114.114; do
+    summary="$(route_summary_v4 "$probe")"
+    rest="${summary#*|}"
+    gw="${rest%%|*}"
+    iface="${rest#*|}"
+    [[ "$iface" == "$interface_v4" && "$gw" == "$gateway_v4" ]] || return 1
+  done
 
   if [[ -n "$interface_v6" ]]; then
     [[ "$(route_interface_v6 2400:3200::1)" == "$interface_v6" ]] || return 1
@@ -1324,14 +1415,14 @@ reconcile() {
   fi
 
   expected_state="$ipv4_gateway|$ipv4_interface|$ipv6_gateway|$ipv6_interface"
-  if ! routes_are_current "$expected_state" "$ipv4_interface" "$ipv6_interface"; then
+  if ! routes_are_current "$expected_state" "$ipv4_gateway" "$ipv4_interface" "$ipv6_interface"; then
     remove_recorded_routes
     add_ipv4_routes "$ipv4_gateway"
     if [[ -n "$ipv6_gateway" ]]; then
       add_ipv6_routes "$ipv6_gateway"
     fi
 
-    if ! routes_are_current_without_state "$ipv4_interface" "$ipv6_interface"; then
+    if ! routes_are_current_without_state "$ipv4_gateway" "$ipv4_interface" "$ipv6_interface"; then
       remove_recorded_routes
       log_once "China-direct route verification failed; all added routes were rolled back"
       return 1
