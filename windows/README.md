@@ -1,4 +1,4 @@
-﻿# ZoogCNBypass for Windows
+# ZoogCNBypass for Windows
 
 在 Windows 上让 ZoogVPN 保持全局连接，同时让中国大陆网站和 IP 通过本地物理网卡直连。分流依据是目标域名和 IP，不区分 App。原理与 macOS 版相同，数据（`../data`）共用。
 
@@ -9,7 +9,8 @@
 | IP 分流 | 把中国大陆 IPv4（及有物理 IPv6 网关时的 IPv6）网段以**更具体的路由**指向物理网关（IP Helper API，非持久，重启自动消失）。其余流量沿 ZoogVPN 隧道（OpenVPN/Wintun 的 `0.0.0.0/1`+`128.0.0.0/1`，或 WireGuard 的 `0.0.0.0/0`）。 |
 | DNS 分流 | 内置本地 DNS 代理 `127.0.0.1:53`：国内域名 → AliDNS `223.5.5.5`/`223.6.6.6`（直连），其余 → `1.1.1.1`/`8.8.8.8`（走隧道）。带 `domain-needed`、`bogus-priv`、`stop-dns-rebind`、缓存与并发上限。 |
 | 系统 DNS 接管 | 一条 NRPT 全局规则（命名空间 `.` → `127.0.0.1`，注释 `ZoogCNBypass`），不修改任何网卡 DNS。Tailscale 等自带更具体 NRPT 规则的程序不受影响。 |
-| 常驻 | 计划任务 `ZoogCNBypass`（SYSTEM、开机启动、失败自动重启），每 3 秒检查 VPN 状态，连接时自动应用、断开时撤销 DNS 接管。 |
+| Kill Switch 与 Tailscale 兼容 | ZoogVPN 开启 Kill Switch 时会在 WFP（`FWPM_SUBLAYER_UNIVERSAL`）中以 `weight = 1` 拦截非隧道网卡的所有出站连接，导致走物理网卡的国内分流路由以及绑定 `0.0.0.0/0` 物理网卡的 `tailscaled.exe`、Tailscale 虚拟网卡（`100.64.0.0/10` / `fd7a:115c:a1e0::/48`）全部返回 `WSAEACCES (10013)`。本工具在 VPN 连接期间自动注入 `weight = 3` 的非持久 WFP 放行规则（物理网卡 LUID、Tailscale 网卡与网段、Tailscale 进程），断开或停止时自动移除。 |
+| 常驻 | 计划任务 `ZoogCNBypass`（SYSTEM、开机启动、失败自动重启），每 3 秒检查 VPN 状态，连接时自动应用、断开时撤销 DNS 接管与 WFP 规则。 |
 | 安全回滚 | 添加路由后用 `GetBestRoute2` 验证，失败整体回滚；只删除自己记录的路由；本地 DNS 不健康或国外流量没走隧道时撤销 DNS 接管。 |
 
 它不会读取或修改 ZoogVPN 的账号、配置和程序文件。
@@ -51,6 +52,7 @@ ZoogVPN: Connected (ZoogVPN TUN, ifIndex 87)
 Scheduled task: Running
 Local DNS service: listening on 127.0.0.1:53
 Split DNS override (NRPT): active
+Kill Switch bypass (WFP): active (physical NIC + Tailscale permitted)
 China-direct routing: active
 Installed IPv4 routes: 5494
 Installed IPv6 routes: 0
@@ -80,6 +82,18 @@ DNS check - www.cloudflare.com: <境外 IP> via ZoogVPN TUN
    - 国内域名改用 **DoH（HTTPS 443）** 直连 AliDNS（`https://223.5.5.5/dns-query`、`223.6.6.6`），国外域名仍经隧道解析。
 
    **这等于绕开了 ZoogVPN 客户端为国内域名设置的 DNS 泄漏防护**：国内域名的 DNS 查询会走物理网卡（加密的 HTTPS，但运营商可见你在连接 AliDNS）。国外域名不受影响。
+## 支持的 ZoogVPN 协议
+
+工具只依赖系统层面的网络形态，不关心 Zoog 用什么协议，凡是「一块 Zoog 隧道适配器 + 全局默认路由」都适用：
+
+| 协议 | 形态 | 状态 |
+|---|---|---|
+| OpenVPN | Wintun/TAP 适配器 `ZoogVPN TUN`，`0.0.0.0/1`+`128.0.0.0/1` | 已实测 |
+| Shadowsocks | 仍是 `ZoogVPN TUN`（Wintun）+ 同样的 `/1` 路由；`openvpn.exe` 把流量经 `127.0.0.1:1080` 交给 `xray`，`xray` 经物理网卡连接服务器（服务器 `/32` 主机路由由 Zoog 自己添加） | 已验证形态与链路；国外 DNS 经 UDP-over-SOCKS，延迟较高，代理对国外上游做了「慢则对冲」 |
+| WireGuard | `ZoogVPNWireguard`（AmneziaWG）适配器，`0.0.0.0/0` | 形态已识别，未实测 |
+
+切换协议后无需重新配置；适配器序号（ifIndex）、隧道地址每次连接都可能变化，守护进程每 3 秒重新识别。
+
 ## 配置
 
 

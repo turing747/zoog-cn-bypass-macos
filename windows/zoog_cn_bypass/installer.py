@@ -114,6 +114,8 @@ def install() -> list[str]:
 
     if task_exists():
         _run(["schtasks.exe", "/End", "/TN", config.TASK_NAME])
+        import time
+        time.sleep(0.8)
 
     root = config.install_dir()
     root.mkdir(parents=True, exist_ok=True)
@@ -191,6 +193,20 @@ def enable() -> list[str]:
         raise RuntimeError("not installed; run `install` first")
     _run(["schtasks.exe", "/Change", "/TN", config.TASK_NAME, "/ENABLE"], check=True)
     _run(["schtasks.exe", "/Run", "/TN", config.TASK_NAME], check=True)
+    try:
+        from .daemon import Reconciler
+        from .nrpt import Nrpt
+        from .routes import StateStore
+
+        net = winnet.WinNet()
+        reconciler = Reconciler(net, Nrpt(), lambda: True, StateStore(config.state_dir()), config.Settings.load())
+        vpn, _ = reconciler.detect_vpn()
+        v4 = reconciler.physical(4)
+        v6 = reconciler.physical(6)
+        if vpn is not None and v4 is not None:
+            reconciler.ensure_wfp_permits(v4[1], v6[1] if v6 else None)
+    except Exception:
+        pass
     return ["ZoogCNBypass enabled. It activates while ZoogVPN is connected (check: status)."]
 
 
@@ -198,6 +214,8 @@ def disable(cleanup_fn) -> list[str]:
     messages: list[str] = []
     if task_exists():
         _run(["schtasks.exe", "/End", "/TN", config.TASK_NAME])
+        import time
+        time.sleep(0.8)
         _run(["schtasks.exe", "/Change", "/TN", config.TASK_NAME, "/DISABLE"])
     messages.extend(cleanup_fn())
     messages.append("ZoogCNBypass disabled. ZoogVPN itself was not disconnected.")

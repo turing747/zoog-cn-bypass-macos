@@ -14,6 +14,7 @@ import ipaddress
 import logging
 import random
 import re
+import select
 import socket
 import ssl
 import struct
@@ -291,11 +292,13 @@ class Resolver:
         foreign_upstreams,
         timeout: float = 2.0,
         cache_size: int = 10000,
+        hedge_delay: float = 0.8,
     ) -> None:
         self.cn_domains = cn_domains
         self.cn_upstreams = tuple(cn_upstreams)
         self.foreign_upstreams = tuple(foreign_upstreams)
         self.timeout = timeout
+        self.hedge_delay = hedge_delay
         self.cache_size = cache_size
         self._cache: OrderedDict[tuple, tuple[float, bytes]] = OrderedDict()
         self._lock = threading.Lock()
@@ -359,7 +362,54 @@ class Resolver:
         except (OSError, struct.error):
             return None
 
+    def _udp_hedged(self, pkt: bytes, upstreams) -> tuple[bytes, tuple] | None:
+        """Ask the first upstream; if it is slow, also ask the next ones and take the first reply.
+
+        Tunnels that carry UDP through a local SOCKS hop (e.g. Shadowsocks) have higher and
+        spikier latency, so a lost datagram must not cost a full timeout.
+        """
+        entries: list[tuple[socket.socket, tuple]] = []
+        deadline = time.monotonic() + self.hedge_delay * (len(upstreams) - 1) + self.timeout
+        try:
+            for index, upstream in enumerate(upstreams):
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                entries.append((sock, upstream))
+                try:
+                    sock.sendto(pkt, upstream)
+                except OSError:
+                    continue
+                last = index == len(upstreams) - 1
+                until = deadline if last else min(deadline, time.monotonic() + self.hedge_delay)
+                while True:
+                    remaining = until - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    ready, _, _ = select.select([s for s, _ in entries], [], [], remaining)
+                    for ready_sock in ready:
+                        try:
+                            data, addr = ready_sock.recvfrom(65535)
+                        except OSError:
+                            continue
+                        source = next(u for s, u in entries if s is ready_sock)
+                        if addr[0] == source[0] and addr[1] == source[1] and data[:2] == pkt[:2]:
+                            return data, source
+            return None
+        except (OSError, ValueError):
+            return None
+        finally:
+            for sock, _ in entries:
+                sock.close()
+
     def _forward(self, pkt: bytes, upstreams) -> bytes | None:
+        plain = [u for u in upstreams if not isinstance(u, DohUpstream)]
+        if len(plain) > 1 and len(plain) == len(upstreams):
+            result = self._udp_hedged(pkt, plain)
+            if result is None:
+                return None
+            data, source = result
+            if len(data) >= 12 and data[2] & 0x02:  # TC bit
+                data = self._tcp(pkt, source) or data
+            return data
         for upstream in upstreams:
             if isinstance(upstream, DohUpstream):
                 data = upstream.query(pkt)
@@ -473,16 +523,21 @@ class DnsProxy:
         return self._tcp.getsockname()[1]
 
     def start(self) -> None:
-        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            udp.bind((self.host, self.port))
-            tcp.bind((self.host, self.port if self.port else udp.getsockname()[1]))
-            tcp.listen(64)
-        except OSError:
-            udp.close()
-            tcp.close()
-            raise
+        # With port 0 (tests) the UDP and TCP sockets must share one free port number.
+        attempts = 20 if self.port == 0 else 1
+        for attempt in range(attempts):
+            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                udp.bind((self.host, self.port))
+                tcp.bind((self.host, self.port if self.port else udp.getsockname()[1]))
+                tcp.listen(64)
+                break
+            except OSError:
+                udp.close()
+                tcp.close()
+                if attempt == attempts - 1:
+                    raise
         if hasattr(socket, "SIO_UDP_CONNRESET"):
             try:
                 udp.ioctl(socket.SIO_UDP_CONNRESET, False)  # type: ignore[attr-defined]

@@ -4,6 +4,7 @@ import socket
 import struct
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -26,16 +27,23 @@ def a_response(pkt: bytes, address: str, ttl: int = 60, rcode: int = 0, truncate
 class FakeUpstream:
     """UDP (+optional TCP) DNS server answering every A query with a fixed address."""
 
-    def __init__(self, address: str, truncate_udp: bool = False):
+    def __init__(self, address: str, truncate_udp: bool = False, delay: float = 0.0):
         self.address = address
         self.truncate_udp = truncate_udp
+        self.delay = delay
         self.queries: list[str] = []
-        self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.udp.bind(("127.0.0.1", 0))
-        self.port = self.udp.getsockname()[1]
+        while True:  # the same port number must be free for UDP and TCP
+            self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.udp.bind(("127.0.0.1", 0))
+            self.port = self.udp.getsockname()[1]
+            self.tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                self.tcp.bind(("127.0.0.1", self.port))
+                break
+            except OSError:
+                self.udp.close()
+                self.tcp.close()
         self.udp.settimeout(0.2)
-        self.tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.tcp.bind(("127.0.0.1", self.port))
         self.tcp.listen(5)
         self.tcp.settimeout(0.2)
         self.stop = threading.Event()
@@ -57,6 +65,8 @@ class FakeUpstream:
             q = d.parse_query(data)
             if q:
                 self.queries.append(q.name)
+                if self.delay:
+                    time.sleep(self.delay)
                 self.udp.sendto(a_response(data, self.address, truncated=self.truncate_udp), addr)
 
     def _tcp_loop(self):
@@ -293,6 +303,50 @@ class DohTests(unittest.TestCase):
         resolver = d.Resolver({"baidu.com"}, [dead, self.doh], [], timeout=1.0)
         response = resolver.resolve(d.build_query("www.baidu.com"))
         self.assertEqual(d.response_info(response)[2], [bytes([223, 9, 9, 9])])
+
+
+class HedgedUpstreams(unittest.TestCase):
+    """High-latency tunnels (Shadowsocks over a local SOCKS hop): slow upstream must not stall."""
+
+    def make(self, first_delay, second_delay, timeout=2.0):
+        first = FakeUpstream("93.184.216.1", delay=first_delay)
+        second = FakeUpstream("93.184.216.2", delay=second_delay)
+        self.addCleanup(first.close)
+        self.addCleanup(second.close)
+        resolver = d.Resolver(set(), [], [first.endpoint, second.endpoint], timeout=timeout,
+                              cache_size=0, hedge_delay=0.2)
+        return resolver, first, second
+
+    def ask(self, resolver, name="slow.example.org"):
+        started = time.monotonic()
+        response = resolver.resolve(d.build_query(name))
+        return d.response_info(response)[2], time.monotonic() - started
+
+    def test_fast_first_upstream_does_not_ask_second(self):
+        resolver, first, second = self.make(0, 0)
+        addrs, took = self.ask(resolver)
+        self.assertEqual(addrs, [bytes([93, 184, 216, 1])])
+        self.assertEqual(second.queries, [])
+        self.assertLess(took, 0.2)
+
+    def test_slow_first_upstream_is_beaten_by_second(self):
+        resolver, first, second = self.make(1.5, 0)
+        addrs, took = self.ask(resolver)
+        self.assertEqual(addrs, [bytes([93, 184, 216, 2])])
+        self.assertLess(took, 0.9)  # hedge after 0.2 s, second answers at once, not after 1.5 s
+
+    def test_late_first_reply_still_accepted_when_second_is_dead(self):
+        resolver, first, second = self.make(0.5, 5.0)
+        addrs, took = self.ask(resolver)
+        self.assertEqual(addrs, [bytes([93, 184, 216, 1])])
+        self.assertGreater(took, 0.4)
+
+    def test_all_slow_returns_servfail_within_deadline(self):
+        resolver, first, second = self.make(5.0, 5.0, timeout=0.4)
+        started = time.monotonic()
+        response = resolver.resolve(d.build_query("dead.example.org"))
+        self.assertEqual(response[3] & 0x0F, d.RCODE_SERVFAIL)
+        self.assertLess(time.monotonic() - started, 1.5)
 
 
 class AllowedSources(unittest.TestCase):

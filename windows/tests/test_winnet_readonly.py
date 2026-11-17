@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from zoog_cn_bypass import winnet  # noqa: E402
+from zoog_cn_bypass import wfp, winnet  # noqa: E402
 
 
 @unittest.skipUnless(winnet.IS_WINDOWS, "Windows only")
@@ -15,6 +15,16 @@ class WinNetReadOnly(unittest.TestCase):
     def test_struct_sizes_match_windows_headers(self):
         self.assertEqual(ctypes.sizeof(winnet.MIB_IPFORWARD_ROW2), 104)
         self.assertEqual(ctypes.sizeof(winnet.MIB_IF_ROW2), 1352)
+        if ctypes.sizeof(ctypes.c_void_p) == 8:
+            self.assertEqual(ctypes.sizeof(wfp.FWP_VALUE0), 16)
+            self.assertEqual(ctypes.sizeof(wfp.FWPM_FILTER_CONDITION0), 40)
+            self.assertEqual(ctypes.sizeof(wfp.FWPM_ACTION0), 20)
+            self.assertEqual(ctypes.sizeof(wfp.FWPM_FILTER0), 200)
+
+    def test_wfp_luid_and_readonly_status(self):
+        loopback = next(a for a in winnet.list_adapters() if a.if_type == 24)
+        self.assertIsNotNone(wfp.ifindex_to_luid(loopback.index))
+        self.assertIsInstance(wfp.wfp_permits_active(), bool)
 
     def test_adapters_have_loopback(self):
         adapters = winnet.list_adapters()

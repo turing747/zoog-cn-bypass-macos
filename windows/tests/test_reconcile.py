@@ -37,6 +37,15 @@ class FakeNet:
         self.delete_calls = 0
         self.break_adds = False
         self.metrics = {ETH: 25, WIFI: 40, VETH: 15, VPN: 3, TS: 5}
+        self.wfp_permits = None
+
+    def ensure_wfp_permits(self, v4_ifindex, v6_ifindex=None, tailscale_ifindexes=()):
+        self.wfp_permits = (v4_ifindex, v6_ifindex, tuple(tailscale_ifindexes))
+        return True
+
+    def remove_wfp_permits(self):
+        self.wfp_permits = None
+        return True
 
     # backend interface -----------------------------------------------------
     def adapters(self):
@@ -137,6 +146,7 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(self.store.read_state(), "192.168.0.1|25||")
         self.assertEqual(self.store.active_count(4), 3)
         self.assertEqual(self.store.active_count(6), 0)  # no physical IPv6 gateway
+        self.assertEqual(self.net.wfp_permits, (ETH, None, (TS,)))
 
     def test_second_run_is_idempotent(self):
         self.r.reconcile()
@@ -164,10 +174,12 @@ class ReconcileTests(unittest.TestCase):
         self.net.vpn_up = False
         self.r.reconcile()
         self.assertFalse(self.nrpt.present)
+        self.assertIsNone(self.net.wfp_permits)
         self.assertEqual(len(self.net.added), 3)  # standby: kept for fast reconnect
         self.net.vpn_up = True
         self.r.reconcile()
         self.assertTrue(self.nrpt.present)
+        self.assertEqual(self.net.wfp_permits, (ETH, None, (TS,)))
 
     def test_disconnect_with_changed_gateway_removes_routes(self):
         self.r.reconcile()

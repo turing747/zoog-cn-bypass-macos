@@ -142,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
                 _print_lines(installer.set_compat_mode(args.state == "on"))
         elif command == "daemon":
             from .daemon import run_daemon
-            return run_daemon(foreground_log=sys.stdout.isatty())
+            return run_daemon(foreground_log=False)
         elif command == "reconcile":
             return _reconcile(args.dry_run)
         elif command == "update-data":

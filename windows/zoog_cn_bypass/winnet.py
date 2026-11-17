@@ -427,6 +427,15 @@ def run_elevated(arguments: list[str], executable: str) -> int:
 class WinNet:
     """The network backend used by the daemon (swapped for a fake in tests)."""
 
+    def __init__(self) -> None:
+        self._wfp = None
+
+    def _wfp_permit(self):
+        if self._wfp is None:
+            from .wfp import WfpPermit
+            self._wfp = WfpPermit()
+        return self._wfp
+
     def adapters(self) -> list[Adapter]:
         return list_adapters()
 
@@ -444,3 +453,14 @@ class WinNet:
 
     def delete_routes(self, family: int, ifindex: int, gateway: str, networks: list[str], metric: int) -> int:
         return sum(1 for network in networks if delete_route(network, ifindex, gateway, metric))
+
+    def ensure_wfp_permits(
+        self,
+        v4_ifindex: int,
+        v6_ifindex: int | None = None,
+        tailscale_ifindexes: tuple[int, ...] = (),
+    ) -> bool:
+        return self._wfp_permit().ensure(v4_ifindex, v6_ifindex, tailscale_ifindexes)
+
+    def remove_wfp_permits(self) -> bool:
+        return self._wfp_permit().remove()

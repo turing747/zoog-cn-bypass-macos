@@ -10,7 +10,7 @@ import socket
 import threading
 from pathlib import Path
 
-from . import config, dnsproxy, winnet
+from . import config, dnsproxy, wfp, winnet
 from .nrpt import Nrpt
 from .routes import (
     StateStore,
@@ -155,6 +155,25 @@ class Reconciler:
         self.store.write_active(family, gateway, ifindex, networks)
         self.net.add_routes(family, ifindex, gateway, networks, config.ROUTE_METRIC)
 
+    # -- WFP Kill Switch permits (China direct + Tailscale) -----------------
+    def tailscale_ifindexes(self) -> tuple[int, ...]:
+        return tuple(
+            sorted(
+                a.index
+                for a in self.net.adapters()
+                if _contains(a.alias + " " + a.description, ("Tailscale",))
+            )
+        )
+
+    def clear_wfp_permits(self) -> None:
+        if hasattr(self.net, "remove_wfp_permits"):
+            self.net.remove_wfp_permits()
+
+    def ensure_wfp_permits(self, if4: int, if6: int | None) -> bool:
+        if not hasattr(self.net, "ensure_wfp_permits"):
+            return True
+        return bool(self.net.ensure_wfp_permits(if4, if6, self.tailscale_ifindexes()))
+
     # -- DNS override ------------------------------------------------------
     def clear_dns_override(self) -> None:
         if self.nrpt.exists():
@@ -199,6 +218,7 @@ class Reconciler:
         vpn, reason = self.detect_vpn()
         if vpn is None:
             self.clear_dns_override()
+            self.clear_wfp_permits()
             if self.store.has_any():
                 v4 = self.physical(4)
                 v6 = self.physical(6)
@@ -221,6 +241,7 @@ class Reconciler:
         v4 = self.physical(4)
         if v4 is None:
             self.clear_dns_override()
+            self.clear_wfp_permits()
             self.log_once("ZoogVPN connected, but no physical IPv4 gateway was found")
             return False
         v6 = self.physical(6)
@@ -228,6 +249,7 @@ class Reconciler:
         expected = self.expected_state(v4, v6)
 
         if self.routes_current(expected, v4[1], if0):
+            self.ensure_wfp_permits(v4[1], if0)
             return self._finish_dns(vpn)
 
         self.remove_recorded_routes()
@@ -236,15 +258,18 @@ class Reconciler:
             self.add_routes(6, v6[0], v6[1])
 
         if self.detect_vpn()[0] is None:
+            self.clear_wfp_permits()
             self.remove_recorded_routes()
             return True
 
         if not self.routes_current_without_state(v4[1], if0):
+            self.clear_wfp_permits()
             self.remove_recorded_routes()
             self.log_once("China-direct route verification failed; all added routes were rolled back")
             return False
 
         self.store.write_state(expected)
+        self.ensure_wfp_permits(v4[1], if0)
         self._message(
             f"China-direct routing active on interface {v4[1]}: "
             f"{self.store.active_count(4)} IPv4 and {self.store.active_count(6)} IPv6 routes"
@@ -254,6 +279,7 @@ class Reconciler:
     def stop(self) -> None:
         """Equivalent of `daemon.sh stop`."""
         self.nrpt.remove()
+        self.clear_wfp_permits()
         self.remove_recorded_routes()
         self.store.clear_error()
 
@@ -274,6 +300,7 @@ class Reconciler:
             f"Physical IPv6: {v6[0]} via ifIndex {v6[1]}" if v6 else "Physical IPv6: none (IPv6 China routes skipped)"
         )
         lines.append(f"Would add {len(self.networks(4))} IPv4 and {len(self.networks(6)) if v6 else 0} IPv6 routes")
+        lines.append("Would add WFP Kill Switch permits: physical NIC + Tailscale (100.64.0.0/10, fd7a:115c:a1e0::/48)")
         lines.append("Would add NRPT rule: '.' -> " + config.LOCAL_DNS)
         return lines
 
@@ -328,6 +355,7 @@ def collect_status(net=None, settings: config.Settings | None = None) -> list[st
         routing = "active" if vpn else "standby (routes retained for fast reconnect)"
     else:
         routing = "inactive"
+    wfp_active = wfp.wfp_permits_active()
 
     lines = [
         f"ZoogVPN: {'Connected (' + vpn.alias + ', ifIndex ' + str(vpn.index) + ')' if vpn else 'Disconnected'}",
@@ -335,6 +363,7 @@ def collect_status(net=None, settings: config.Settings | None = None) -> list[st
         f"Local DNS service: {'listening on ' + dns_host + ':' + str(config.LOCAL_DNS_PORT) if dns_listening else 'not responding'}",
         f"Compatibility mode: {'ON (DNS on tunnel address, domestic DNS over DoH)' if settings.compat_mode else 'off'}",
         f"Split DNS override (NRPT): {'active' if nrpt_active else 'inactive'}",
+        f"Kill Switch bypass (WFP): {'active (physical NIC + Tailscale permitted)' if wfp_active else 'inactive'}",
         f"China-direct routing: {routing}",
         f"Installed IPv4 routes: {store.active_count(4) if store else 0}",
         f"Installed IPv6 routes: {store.active_count(6) if store else 0}",
@@ -402,6 +431,8 @@ def cleanup(net=None) -> list[str]:
     reconciler = Reconciler(net, Nrpt(), lambda: True, store, config.Settings.load(), networks={4: [], 6: []})
     reconciler.nrpt.remove()
     messages.append("NRPT rule removed")
+    reconciler.clear_wfp_permits()
+    messages.append("WFP permit rules removed")
     reconciler.remove_recorded_routes()
     messages.append("Recorded routes removed")
 
